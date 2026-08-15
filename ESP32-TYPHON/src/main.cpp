@@ -1,5 +1,5 @@
 /*
- * ESP32-DIV – ST7735 / Joystick Port
+ * ESP32 TYPHON – ST7735 + Soft-AP Web UI
  * Target : ESP32-WROOM + 1.8" ST7735 (160x128) + HW-504
  * Scope  : Wi-Fi + BLE tools, minimal UI
  *
@@ -16,7 +16,7 @@
 void setup() {
   Serial.begin(115200);
   delay(200);
-  Serial.println("\n=== ESP32-DIV ST7735 Port ===");
+  Serial.println("\n=== ESP32 TYPHON ===");
   Serial.printf("Display : %dx%d rotation %d\n", SCREEN_W, SCREEN_H, DISPLAY_ROTATION);
   Serial.println("Joystick: VRX=34 VRY=35 SW=32");
 

@@ -18,6 +18,10 @@
 #define JOY_VRY           35      // ADC1
 #define JOY_SW            32      // Digital, active LOW (pull-up)
 
+// -------------------- Boot button + onboard LED --------------------
+#define BOOT_BTN          0       // BOOT / GPIO0 (active LOW)
+#define STATUS_LED        2       // Blue LED on most ESP32-WROOM DevKits
+
 // Analog center & deadzone (12-bit ADC 0-4095)
 #define JOY_CENTER        2048
 #define JOY_DEADZONE      400
