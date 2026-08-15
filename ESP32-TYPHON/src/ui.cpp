@@ -18,7 +18,7 @@
 #include "esp_timer.h"
 
 // Required so ESP32 accepts raw 802.11 TX frames
-extern "C" int ieee80211_raw_frame_sanity_check(int32_t, int32_t, int32_t) {
+extern "C" int __wrap_ieee80211_raw_frame_sanity_check(int32_t a, int32_t b, int32_t c) {
   return 0;
 }
 
