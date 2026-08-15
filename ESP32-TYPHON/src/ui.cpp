@@ -1377,7 +1377,7 @@ static void drawDeauthDetScreen() {
   Theme::drawFooter("L/R=Mode", "Sel=Reset");
 }
 
-static void drawDeauthScreen() {
+static void drawDeauthScreen(int sel, int top) {
   Theme::drawStatusBar("Deauth Attack");
   if (deauthRunning) {
     Theme::printCentered("ATTACKING", 36, COL_ERR, 1);
@@ -1399,11 +1399,10 @@ static void drawDeauthScreen() {
     Theme::printCentered("Scan first", 66, COL_DIM, 1);
     Theme::drawFooter(nullptr, "L-Back");
   } else {
-    // Row 0 = ALL, then real SSIDs (draw as menu for simplicity)
     static const char* items[WIFI_MAX_NETS + 1];
     items[0] = ">> ALL NETWORKS <<";
     for (int i = 0; i < wifiCount; i++) items[i + 1] = wifiNets[i].ssid.c_str();
-    Theme::drawMenuList(items, wifiCount + 1, _sel, _top, 18, 14);
+    Theme::drawMenuList(items, wifiCount + 1, sel, top, 18, 14);
     Theme::drawFooter("Pick target", "Sel=Start");
   }
 }
@@ -1549,7 +1548,7 @@ void UI::drawCurrent() {
     case SCR_PACKET_MON:  drawPacketMonitor(); break;
     case SCR_BEACON:      drawBeaconScreen(); break;
     case SCR_DEAUTH_DET:  drawDeauthDetScreen(); break;
-    case SCR_DEAUTH:      drawDeauthScreen(); break;
+    case SCR_DEAUTH:      drawDeauthScreen(_sel, _top); break;
     case SCR_PROBE:       drawProbeScreen(); break;
     case SCR_CAPTIVE:     drawCaptiveScreen(); break;
     case SCR_BLE_SNIFF:   drawBleSniffScreen(); break;
