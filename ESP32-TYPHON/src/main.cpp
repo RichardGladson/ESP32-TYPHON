@@ -14,9 +14,11 @@
 #include "UI.h"
 
 void setup() {
+  setCpuFrequencyMhz(240);  // max clock
   Serial.begin(115200);
   delay(200);
   Serial.println("\n=== ESP32 TYPHON ===");
+  Serial.printf("CPU     : %u MHz\n", getCpuFrequencyMhz());
   Serial.printf("Display : %dx%d rotation %d\n", SCREEN_W, SCREEN_H, DISPLAY_ROTATION);
   Serial.println("Joystick: VRX=34 VRY=35 SW=32");
 

