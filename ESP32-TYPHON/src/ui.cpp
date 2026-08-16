@@ -1325,7 +1325,288 @@ static void jamUpdate() {
 }
 
 // ============================================================
-//  AirTag Tools – Spoofer + simple finder
+//  AirTag Detector + Spoofer (nyanBOX-style, NimBLE)
+// ============================================================
+#define AIRTAG_MAX 32
+
+struct AirTagDev {
+  char     addr[18];
+  char     name[24];
+  int8_t   rssi;
+  uint32_t lastSeen;
+  uint8_t  payload[62];
+  uint8_t  payloadLen;
+};
+
+static AirTagDev airTags[AIRTAG_MAX];
+static int       airTagCount = 0;
+
+static bool     airDetRunning = false;
+static uint32_t airDetLast = 0;
+static bool     airDetScanning = false;
+
+static bool     airSpoofRunning = false;
+static int      airSpoofTarget = -1;  // -1 = spam all, >=0 = single index
+static int      airSpoofIdx = 0;
+static uint32_t airSpoofLast = 0;
+static uint32_t airTagSent = 0;
+
+// Legacy flags used by stopAllTools / status JSON
+static bool airTagRunning = false;
+static int  airTagMode = 0;  // 0=menu 1=detect 2=spoof
+static int  airMenuSel = 0;
+static int  uiSelAir() { return airMenuSel; }
+
+static bool isAirTagPayload(const uint8_t* payload, uint8_t len) {
+  if (!payload || len < 4) return false;
+  for (int i = 0; i <= (int)len - 4; i++) {
+    // 1E FF 4C 00  — full Apple manufacturer AD
+    if (payload[i] == 0x1E && payload[i+1] == 0xFF &&
+        payload[i+2] == 0x4C && payload[i+3] == 0x00)
+      return true;
+    // 4C 00 12 19 — Find My / Offline Finding
+    if (payload[i] == 0x4C && payload[i+1] == 0x00 &&
+        payload[i+2] == 0x12 && payload[i+3] == 0x19)
+      return true;
+  }
+  return false;
+}
+
+static int airTagFindAddr(const char* addr) {
+  for (int i = 0; i < airTagCount; i++)
+    if (strcmp(airTags[i].addr, addr) == 0) return i;
+  return -1;
+}
+
+static void airTagSortByRssi() {
+  for (int i = 0; i < airTagCount - 1; i++)
+    for (int j = i + 1; j < airTagCount; j++)
+      if (airTags[j].rssi > airTags[i].rssi) {
+        AirTagDev t = airTags[i]; airTags[i] = airTags[j]; airTags[j] = t;
+      }
+}
+
+static void airDetProcessScan() {
+  NimBLEScan* scan = NimBLEDevice::getScan();
+  NimBLEScanResults results = scan->getResults();
+  uint32_t now = millis();
+  int n = (int)results.getCount();
+  for (int i = 0; i < n; i++) {
+    NimBLEAdvertisedDevice d = results.getDevice(i);
+    // Build payload buffer from manufacturer data + raw if available
+    uint8_t buf[62];
+    uint8_t blen = 0;
+    bool match = false;
+
+    if (d.haveManufacturerData()) {
+      std::string mfg = d.getManufacturerData();
+      // NimBLE manufacturer data is typically company ID (2 LE) + rest
+      // Rebuild AD-style: len, 0xFF, then bytes
+      if (mfg.size() >= 2 && mfg.size() < 30) {
+        buf[0] = (uint8_t)(mfg.size() + 1);
+        buf[1] = 0xFF;
+        memcpy(buf + 2, mfg.data(), mfg.size());
+        blen = (uint8_t)(mfg.size() + 2);
+        if (isAirTagPayload(buf, blen)) match = true;
+        // Also test raw mfg bytes
+        if (!match && isAirTagPayload((const uint8_t*)mfg.data(), (uint8_t)mfg.size())) {
+          memcpy(buf, mfg.data(), mfg.size());
+          blen = (uint8_t)mfg.size();
+          match = true;
+        }
+      }
+    }
+
+    // Fallback: some stacks expose payload via getPayload
+    if (!match) {
+      // Check service data / name not enough — skip non-mfg
+      continue;
+    }
+    if (!match) continue;
+
+    String addrS = d.getAddress().toString().c_str();
+    char addr[18];
+    strncpy(addr, addrS.c_str(), 17);
+    addr[17] = 0;
+
+    int idx = airTagFindAddr(addr);
+    if (idx < 0) {
+      if (airTagCount >= AIRTAG_MAX) continue;
+      idx = airTagCount++;
+      strncpy(airTags[idx].addr, addr, 17);
+      airTags[idx].addr[17] = 0;
+      strcpy(airTags[idx].name, "AirTag");
+    }
+    airTags[idx].rssi = (int8_t)d.getRSSI();
+    airTags[idx].lastSeen = now;
+    if (blen > 0 && blen < 62) {
+      memcpy(airTags[idx].payload, buf, blen);
+      airTags[idx].payloadLen = blen;
+    }
+    if (d.haveName()) {
+      strncpy(airTags[idx].name, d.getName().c_str(), 23);
+      airTags[idx].name[23] = 0;
+    }
+  }
+  airTagSortByRssi();
+  scan->clearResults();
+}
+
+static void airDetStart() {
+  airDetRunning = true;
+  airTagRunning = true;
+  airTagMode = 1;
+  airDetLast = 0;
+  airDetScanning = false;
+  airTagCount = 0;
+  bleInit();
+  if (bleScanning) {
+    NimBLEDevice::getScan()->stop();
+    bleScanning = false;
+  }
+  NimBLEDevice::getAdvertising()->stop();
+  // kick scan
+  NimBLEScan* scan = NimBLEDevice::getScan();
+  scan->setActiveScan(true);
+  scan->setInterval(80);
+  scan->setWindow(60);
+  scan->setMaxResults(40);
+  scan->start(6, nullptr, false);
+  airDetScanning = true;
+  airDetLast = millis();
+}
+
+static void airDetStop() {
+  airDetRunning = false;
+  airDetScanning = false;
+  if (airTagMode == 1) {
+    airTagRunning = false;
+    airTagMode = 0;
+  }
+  NimBLEDevice::getScan()->stop();
+}
+
+static void airDetUpdate() {
+  if (!airDetRunning) return;
+  NimBLEScan* scan = NimBLEDevice::getScan();
+  if (airDetScanning) {
+    if (scan->isScanning()) return;
+    airDetScanning = false;
+    airDetProcessScan();
+    airDetLast = millis();
+    return;
+  }
+  // Rescan every ~2s while detector active
+  if (millis() - airDetLast > 2000) {
+    scan->setActiveScan(true);
+    scan->start(5, nullptr, false);
+    airDetScanning = true;
+    airDetLast = millis();
+  }
+}
+
+static void airSpoofStop() {
+  if (!airSpoofRunning) return;
+  airSpoofRunning = false;
+  airTagRunning = false;
+  airTagMode = 0;
+  NimBLEDevice::getAdvertising()->stop();
+}
+
+static void airSpoofStart(int targetIdx) {
+  // targetIdx: -1 = all, >=0 = one entry (must exist)
+  if (airTagCount <= 0) return;
+  if (targetIdx >= airTagCount) targetIdx = 0;
+  airDetStop();
+  sniffStop(); spoofStop(); sourStop(); jamStop();
+  bleInit();
+  airSpoofTarget = targetIdx;
+  airSpoofIdx = (targetIdx >= 0) ? targetIdx : 0;
+  airSpoofRunning = true;
+  airTagRunning = true;
+  airTagMode = 2;
+  airSpoofLast = 0;
+  airTagSent = 0;
+}
+
+static void airSpoofUpdate() {
+  if (!airSpoofRunning) return;
+  if (airTagCount <= 0) { airSpoofStop(); return; }
+  if (millis() - airSpoofLast < 15) return;
+  airSpoofLast = millis();
+  airTagSent++;
+
+  int idx;
+  if (airSpoofTarget >= 0 && airSpoofTarget < airTagCount) {
+    idx = airSpoofTarget;
+  } else {
+    idx = airSpoofIdx % airTagCount;
+    airSpoofIdx = (airSpoofIdx + 1) % airTagCount;
+  }
+
+  AirTagDev& d = airTags[idx];
+  if (d.payloadLen < 4) {
+    // Synthetic Find My style if no captured payload
+    uint8_t pkt[31];
+    pkt[0] = 0x1E; pkt[1] = 0xFF; pkt[2] = 0x4C; pkt[3] = 0x00;
+    pkt[4] = 0x12; pkt[5] = 0x19; pkt[6] = 0x00;
+    for (int i = 7; i < 31; i++) pkt[i] = (uint8_t)esp_random();
+    memcpy(d.payload, pkt, 31);
+    d.payloadLen = 31;
+  }
+
+  NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
+  adv->stop();
+  NimBLEAdvertisementData data;
+  data.addData(std::string((char*)d.payload, d.payloadLen));
+  adv->setAdvertisementData(data);
+  adv->setMinInterval(0x20);
+  adv->setMaxInterval(0x40);
+  NimBLEDevice::setPower(ESP_PWR_LVL_P9);
+  adv->start();
+}
+
+// Compatibility wrappers used elsewhere
+static void airTagStart() {
+  airTagMode = 0;
+  airTagRunning = false;
+  airDetRunning = false;
+  airSpoofRunning = false;
+  bleInit();
+  NimBLEDevice::getAdvertising()->stop();
+}
+
+static void airTagStop() {
+  airDetStop();
+  airSpoofStop();
+  airTagRunning = false;
+  airTagMode = 0;
+}
+
+static void airTagBeginSpoof() {
+  // Random synthetic Find My if no detections yet
+  if (airTagCount == 0) {
+    airTagCount = 1;
+    strcpy(airTags[0].addr, "00:00:00:00:00:00");
+    strcpy(airTags[0].name, "Synthetic");
+    airTags[0].rssi = -50;
+    airTags[0].lastSeen = millis();
+    uint8_t pkt[31];
+    pkt[0] = 0x1E; pkt[1] = 0xFF; pkt[2] = 0x4C; pkt[3] = 0x00;
+    pkt[4] = 0x12; pkt[5] = 0x19;
+    for (int i = 6; i < 31; i++) pkt[i] = (uint8_t)esp_random();
+    memcpy(airTags[0].payload, pkt, 31);
+    airTags[0].payloadLen = 31;
+  }
+  airSpoofStart(-1);
+}
+
+static void airTagUpdate() {
+  airDetUpdate();
+  airSpoofUpdate();
+}
+
+
 // ============================================================
 static bool airTagRunning = false;
 static uint32_t airTagLast = 0;
@@ -1489,7 +1770,8 @@ label.lbl{font-size:.75rem;color:var(--dim);display:block;margin:8px 0 4px}
     <div class="tile" onclick="go('ble-spoof')"><div class="ico">🎭</div><h2>BLE Spoofer</h2><p>Fake names</p></div>
     <div class="tile" onclick="go('ble-sour')"><div class="ico">🍎</div><h2>Sour Apple</h2><p>Pick model / action</p></div>
     <div class="tile" onclick="go('ble-jam')"><div class="ico">📻</div><h2>BLE Jammer</h2><p>Noise flood</p></div>
-    <div class="tile" onclick="go('ble-air')"><div class="ico">🏷</div><h2>AirTag Spoof</h2><p>Find My style ADV</p></div>
+    <div class="tile" onclick="go('ble-airdet')"><div class="ico">📍</div><h2>AirTag Detector</h2><p>Find nearby AirTags</p></div>
+    <div class="tile" onclick="go('ble-air')"><div class="ico">🏷</div><h2>AirTag Spoofer</h2><p>Clone / spam payloads</p></div>
   </div>
   <button class="danger stopall" onclick="act('stop_all')">Stop all tools</button>
 </div>
@@ -1636,12 +1918,27 @@ label.lbl{font-size:.75rem;color:var(--dim);display:block;margin:8px 0 4px}
   </div>
 </div>
 
-<div id="v-ble-air" class="view">
-  <div class="nav"><button class="back" onclick="go('ble')">← Bluetooth</button><h2 style="font-size:1rem">AirTag Spoof</h2></div>
+<div id="v-ble-airdet" class="view">
+  <div class="nav"><button class="back" onclick="go('ble')">← Bluetooth</button><h2 style="font-size:1rem">AirTag Detector</h2></div>
   <div class="card">
-    <h3>Find My ADV</h3>
-    <div class="row"><button id="btnAir" class="attack" onclick="toggle('air')">Start</button></div>
-    <div class="msg">Sent: <b id="airSent">0</b></div>
+    <h3>Scan for AirTags</h3>
+    <div class="row"><button id="btnAirDet" onclick="toggleAirDet()">Start</button></div>
+    <div class="msg">Found: <b id="airCount">0</b></div>
+    <div class="list" id="airList"></div>
+  </div>
+</div>
+
+<div id="v-ble-air" class="view">
+  <div class="nav"><button class="back" onclick="go('ble')">← Bluetooth</button><h2 style="font-size:1rem">AirTag Spoofer</h2></div>
+  <div class="card">
+    <h3>Clone / Spam</h3>
+    <div class="msg">Run Detector first to capture real payloads, or start for synthetic Find My ADV.</div>
+    <label class="lbl">Target</label>
+    <select id="airTarget"><option value="-1">Spam all / synthetic</option></select>
+    <div class="row">
+      <button id="btnAir" class="attack" onclick="toggle('air')">Start</button>
+    </div>
+    <div class="msg">Sent: <b id="airSent">0</b> · Captured: <b id="airCount2">0</b></div>
   </div>
 </div>
 
@@ -1725,6 +2022,13 @@ function apply(s){
   document.getElementById('probeSent').textContent=s.probeSent||0;
   document.getElementById('jamCount').textContent=s.jamCount||0;
   document.getElementById('airSent').textContent=s.airSent||0;
+  const ac=s.airCount||0;
+  const ace=document.getElementById('airCount'); if(ace) ace.textContent=ac;
+  const ac2=document.getElementById('airCount2'); if(ac2) ac2.textContent=ac;
+  setToggle('btnAirDet', s.airDet);
+  setToggle('btnAir', s.air);
+  renderAir(s.airtags);
+  fillAirTargets(s.airtags);
   document.getElementById('sourSent').textContent=s.sourSent||0;
   document.getElementById('sourName').textContent=s.sourName||'—';
   document.getElementById('wscanMsg').textContent=s.wifiScanning?'Scanning… keeping previous list until done':((s.wifi&&s.wifi.length)?(s.wifi.length+' networks'):'No networks yet');
@@ -1756,7 +2060,37 @@ async function act(action,extra){
 }
 function toggle(tool){
   const on={pm:S.pm,beacon:S.beacon,deauth:S.deauth,det:S.det,probe:S.probe,spoof:S.spoof,sour:S.sour,jam:S.jam,air:S.air,sniff:S.sniff}[tool];
+  if(tool==='air'){
+    if(on) act('air_stop');
+    else {
+      const t=parseInt(document.getElementById('airTarget').value);
+      act('air_start',{target:isNaN(t)?-1:t});
+    }
+    return;
+  }
   if(on) act(tool+'_stop'); else act(tool+'_start');
+}
+function renderAir(list){
+  const el=document.getElementById('airList');
+  if(!el) return;
+  if(!list||!list.length){el.innerHTML='<div class="item"><span>No AirTags yet — start detector</span></div>';return;}
+  el.innerHTML=list.map(n=>`<div class="item"><div><b>${esc(n.name||'AirTag')}</b>
+    <div class="meta">${esc(n.addr||'')} · ${n.plen||0} B</div></div>
+    <div class="${rssiClass(n.rssi)}">${n.rssi} dBm</div></div>`).join('');
+}
+let airTargetsReady=false, airTargetsSig='';
+function fillAirTargets(list){
+  const sel=document.getElementById('airTarget'); if(!sel) return;
+  const sig=list?(list.length+':'+(list.map(x=>x.addr).join(','))):'0';
+  if(sig===airTargetsSig) return;
+  airTargetsSig=sig;
+  const cur=sel.value;
+  sel.innerHTML='<option value="-1">Spam all / synthetic</option>';
+  (list||[]).forEach((n,i)=>{const o=document.createElement('option');o.value=i;o.textContent=(n.name||'AirTag')+' '+((n.addr||'').slice(-8));sel.appendChild(o);});
+  sel.value=cur;
+}
+function toggleAirDet(){
+  if(S.airDet) act('air_det_stop'); else act('air_det_start');
 }
 setInterval(refresh,1500); refresh();
 </script>
@@ -1775,10 +2109,10 @@ static String jsonStatus() {
              probeRunning || sniffRunning || spoofRunning || sourRunning ||
              jamRunning || airTagRunning;
   const char* mode = "idle";
-  if (wifiScanning || bleScanning || sniffRunning || pmRunning) mode = "scanning";
+  if (wifiScanning || bleScanning || sniffRunning || pmRunning || airDetRunning) mode = "scanning";
   else if (detRunning) mode = "defending";
   else if (beaconRunning || deauthRunning || probeRunning || spoofRunning ||
-           sourRunning || jamRunning || airTagRunning) mode = "attacking";
+           sourRunning || jamRunning || airSpoofRunning) mode = "attacking";
   j += "\"mode\":\""; j += mode; j += "\",";
   j += "\"any\":"; j += any ? "true," : "false,";
   j += "\"pm\":"; j += pmRunning ? "true," : "false,";
@@ -1789,7 +2123,9 @@ static String jsonStatus() {
   j += "\"spoof\":"; j += spoofRunning ? "true," : "false,";
   j += "\"sour\":"; j += sourRunning ? "true," : "false,";
   j += "\"jam\":"; j += jamRunning ? "true," : "false,";
-  j += "\"air\":"; j += airTagRunning ? "true," : "false,";
+  j += "\"air\":"; j += airSpoofRunning ? "true," : "false,";
+  j += "\"airDet\":"; j += airDetRunning ? "true," : "false,";
+  j += "\"airCount\":" + String(airTagCount) + ",";
   j += "\"sniff\":"; j += sniffRunning ? "true," : "false,";
   j += "\"wifiScanning\":"; j += wifiScanning ? "true," : "false,";
   j += "\"bleScanning\":"; j += bleScanning ? "true," : "false,";
@@ -1865,6 +2201,15 @@ static String jsonStatus() {
          ",\"hits\":" + String((unsigned long)bleDevs[i].hits) +
          ",\"sus\":" + String(bleDevs[i].suspicious ? "true" : "false") +
          ",\"rand\":" + String(bleDevs[i].randomized ? "true" : "false") + "}";
+  }
+  j += "],\"airtags\":[";
+  for (int i = 0; i < airTagCount; i++) {
+    if (i) j += ",";
+    String nm = airTags[i].name; nm.replace("\"", "'");
+    String ad = airTags[i].addr; ad.replace("\"", "'");
+    j += "{\"name\":\"" + nm + "\",\"addr\":\"" + ad +
+         "\",\"rssi\":" + String((int)airTags[i].rssi) +
+         ",\"plen\":" + String(airTags[i].payloadLen) + "}";
   }
   j += "]}";
   return j;
@@ -2006,7 +2351,24 @@ static void handleWebApi() {
   else if (action == "sour_stop") { sourStop(); msg = "Sour Apple stopped"; }
   else if (action == "jam_start") { sniffStop(); spoofStop(); sourStop(); airTagStop(); jamStart(); msg = "Jammer started"; }
   else if (action == "jam_stop") { jamStop(); msg = "Jammer stopped"; }
-  else if (action == "air_start") { sniffStop(); spoofStop(); sourStop(); jamStop(); airTagBeginSpoof(); msg = "AirTag spoof started"; }
+  else if (action == "air_det_start") {
+    sniffStop(); spoofStop(); sourStop(); jamStop(); airSpoofStop();
+    airDetStart();
+    msg = "AirTag detector started";
+  }
+  else if (action == "air_det_stop") { airDetStop(); msg = "AirTag detector stopped"; }
+  else if (action == "air_start") {
+    sniffStop(); spoofStop(); sourStop(); jamStop(); airDetStop();
+    int atarget = -1;
+    int tp = body.indexOf("\"target\"");
+    if (tp >= 0) {
+      int c = body.indexOf(':', tp);
+      if (c > 0) atarget = body.substring(c + 1).toInt();
+    }
+    if (airTagCount == 0) airTagBeginSpoof();
+    else airSpoofStart(atarget);
+    msg = "AirTag spoof started";
+  }
   else if (action == "air_stop") { airTagStop(); msg = "AirTag stopped"; }
   else msg = "Unknown action";
 
@@ -2126,7 +2488,7 @@ void UI::enterScreen(Screen s) {
     if (_sel >= 6) _top = _sel - 5;
   }
   if (s == SCR_BLE_JAM)    { jamStop(); }
-  if (s == SCR_AIRTAG)     airTagStart();  // mode 0 = menu
+  if (s == SCR_AIRTAG)     { airTagStart(); airMenuSel = 0; }
 }
 
 void UI::goBack() {
@@ -2284,15 +2646,25 @@ void UI::handleInput(JoyAction a) {
 
   // AirTag Tools
   if (_screen == SCR_AIRTAG) {
-    if (airTagRunning) {
+    if (airDetRunning || airSpoofRunning) {
       if (a == JOY_BACK || a == JOY_SELECT) { airTagStop(); airTagMode = 0; _dirty = true; }
       return;
     }
-    // simple two-option menu: Spoof / Back handled by long press
+    if (a == JOY_UP) { if (airMenuSel > 0) { airMenuSel--; _dirty = true; } return; }
+    if (a == JOY_DOWN) { if (airMenuSel < 2) { airMenuSel++; _dirty = true; } return; }
     if (a == JOY_SELECT) {
-      airTagBeginSpoof();
-      _dirty = true;
-    } else if (a == JOY_BACK) goBack();
+      if (airMenuSel == 0) { airDetStart(); _dirty = true; }
+      else if (airMenuSel == 1) {
+        if (airTagCount == 0) airTagBeginSpoof();
+        else airSpoofStart(-1);
+        _dirty = true;
+      }
+      else if (airMenuSel == 2) {
+        if (airTagCount > 0) { airSpoofStart(0); _dirty = true; }
+      }
+      return;
+    }
+    if (a == JOY_BACK) goBack();
     return;
   }
 
@@ -2588,19 +2960,42 @@ static void drawJamScreen() {
 
 static void drawAirTagScreen() {
   Theme::drawStatusBar("AirTag Tools");
-  if (airTagRunning && airTagMode == 1) {
-    Theme::printCentered("SPOOFING", 40, COL_OK, 1);
-    Theme::printCentered("Find My style", 58, COL_FG, 1);
-    char buf[24];
+  char buf[28];
+  if (airDetRunning) {
+    Theme::printCentered("DETECTING", 28, COL_ACCENT, 1);
+    snprintf(buf, sizeof(buf), "Found %d", airTagCount);
+    Theme::printCentered(buf, 48, COL_FG, 1);
+    if (airTagCount > 0) {
+      snprintf(buf, sizeof(buf), "%.12s %ddBm", airTags[0].name, (int)airTags[0].rssi);
+      Theme::printCentered(buf, 64, COL_DIM, 1);
+    } else {
+      Theme::printCentered("Scanning BLE...", 64, COL_DIM, 1);
+    }
+    Theme::drawFooter("Sel=Stop", "L-Back");
+  } else if (airSpoofRunning) {
+    Theme::printCentered("SPOOFING", 28, COL_ERR, 1);
+    if (airSpoofTarget < 0) Theme::printCentered("Spam all", 44, COL_FG, 1);
+    else Theme::printCentered("Clone one", 44, COL_FG, 1);
     snprintf(buf, sizeof(buf), "Sent %lu", (unsigned long)airTagSent);
+    Theme::printCentered(buf, 60, COL_DIM, 1);
+    snprintf(buf, sizeof(buf), "%d captured", airTagCount);
     Theme::printCentered(buf, 74, COL_DIM, 1);
     Theme::drawFooter("Sel=Stop", "L-Back");
   } else {
-    Theme::printCentered("AirTag Spoofer", 44, COL_TITLE, 1);
-    Theme::printCentered("Sel = Start", 66, COL_DIM, 1);
-    Theme::drawFooter(nullptr, "L-Back");
+    // Menu: Detect / Spam all / Clone first
+    const char* items[] = { "Detect AirTags", "Spam all / synth", "Clone first hit" };
+    for (int i = 0; i < 3; i++) {
+      char line[28];
+      snprintf(line, sizeof(line), "%s %s", (i == uiSelAir()) ? ">" : " ", items[i]);
+      Theme::printCentered(line, 32 + i * 14, (i == uiSelAir()) ? COL_ACCENT : COL_FG, 1);
+    }
+    snprintf(buf, sizeof(buf), "Saved: %d", airTagCount);
+    Theme::printCentered(buf, 80, COL_DIM, 1);
+    Theme::drawFooter("Up/Dn", "Sel / L-Back");
   }
 }
+
+
 
 void UI::drawCurrent() {
 
