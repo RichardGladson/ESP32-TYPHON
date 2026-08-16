@@ -2974,7 +2974,7 @@ static void drawDeauthScreen(int sel, int top) {
   }
 }
 
-static void drawProbeScreen() {
+static void drawProbeScreen(int sel, int top) {
   Theme::drawStatusBar("Probe Stress");
   char buf[28];
   if (probeRunning) {
@@ -2996,7 +2996,7 @@ static void drawProbeScreen() {
   } else {
     static const char* items[WIFI_MAX_NETS];
     for (int i = 0; i < wifiCount; i++) items[i] = wifiNets[i].ssid.c_str();
-    Theme::drawMenuList(items, wifiCount, _sel, _top, 18, 14);
+    Theme::drawMenuList(items, wifiCount, sel, top, 18, 14);
     Theme::drawFooter("Pick AP", "Sel=Start");
   }
 }
@@ -3158,7 +3158,7 @@ void UI::drawCurrent() {
     case SCR_BEACON:      drawBeaconScreen(); break;
     case SCR_DEAUTH_DET:  drawDeauthDetScreen(); break;
     case SCR_DEAUTH:      drawDeauthScreen(_sel, _top); break;
-    case SCR_PROBE:       drawProbeScreen(); break;
+    case SCR_PROBE:       drawProbeScreen(_sel, _top); break;
     case SCR_CAPTIVE:     drawCaptiveScreen(); break;
     case SCR_BLE_SNIFF:   drawBleSniffScreen(); break;
     case SCR_BLE_SPOOF:   drawBleSpoofScreen(); break;
