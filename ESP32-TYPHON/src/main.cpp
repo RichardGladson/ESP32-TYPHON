@@ -23,11 +23,12 @@ void setup() {
   Serial.println("Joystick: VRX=34 VRY=35 SW=32");
 
   ui.begin();
-  Serial.println("UI ready.");
+  Serial.println("UI ready. Dual-core workers + war mode available.");
+  Serial.printf("Free heap: %u\n", ESP.getFreeHeap());
 }
 
 void loop() {
   ui.loop();
   // Keep loop light – feature tools will add their own work later
-  delay(5);   // small yield, keeps UI responsive without busy-spin
+  // no delay — tool loops + handleClient need full speed
 }
