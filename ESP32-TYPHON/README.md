@@ -1,4 +1,4 @@
-# ESP32 TYPHON – ST7735 + Joystick + Soft-AP Web UI
+# ESP32 TYPHON – Wireless pentesting tool
 
 Port of ESP32-DIV focused on 1.8" ST7735 (160x128) + HW-504 joystick.
 
