@@ -10,6 +10,8 @@ namespace Theme {
   void init();
   void clear(uint16_t color = COL_BG);
   void drawStatusBar(const char* title, int holdPct = -1);
+  // Only paints top-right (no full clear) — level 0 hides, 1..9 shows
+  void drawHoldCounter(int level);
   void drawFooter(const char* left = nullptr, const char* right = nullptr);
 
   static const int MENU_ROWS = 5;

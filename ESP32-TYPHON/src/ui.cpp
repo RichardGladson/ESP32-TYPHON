@@ -4837,14 +4837,16 @@ void UI::loop() {
     _dirty = true;
   }
 
-  // Hold progress counter — refresh header while button down
-  static uint8_t lastHoldPct = 255;
-  uint8_t hp = joystick.isButtonDown() ? joystick.holdProgress() : 0;
+  // Hold counter: ONLY repaint top-right (1..9). Never full-screen redraw.
+  static uint8_t lastHoldLvl = 0;
+  uint8_t lvl = 0;
   if (joystick.isButtonDown()) {
-    if (_screen == SCR_WIFI_SCAN) hp = joystick.holdProgress2();
-    if (hp != lastHoldPct) { lastHoldPct = hp; _dirty = true; }
-  } else {
-    if (lastHoldPct != 255) { lastHoldPct = 255; _dirty = true; }
+    lvl = (_screen == SCR_WIFI_SCAN) ? joystick.holdProgress2()
+                                     : joystick.holdProgress();
+  }
+  if (lvl != lastHoldLvl) {
+    lastHoldLvl = lvl;
+    Theme::drawHoldCounter(lvl);  // 0 clears corner
   }
 
   JoyAction a = joystick.getAction();

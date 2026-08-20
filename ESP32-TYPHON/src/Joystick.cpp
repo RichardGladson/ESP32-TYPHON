@@ -33,17 +33,22 @@ uint32_t Joystick::heldMs() const {
 }
 
 uint8_t Joystick::holdProgress() const {
+  // 0 = not held / just pressed; 1..9 = progress to JOY_LONG_MS
   if (!_btnDown) return 0;
   uint32_t ms = heldMs();
-  if (ms >= JOY_LONG_MS) return 100;
-  return (uint8_t)((ms * 100UL) / JOY_LONG_MS);
+  if (ms >= JOY_LONG_MS) return 9;
+  // map (0, LONG) -> (1..8) then 9 at end
+  uint8_t v = (uint8_t)((ms * 9UL) / JOY_LONG_MS);
+  return v < 1 ? 1 : (v > 9 ? 9 : v);
 }
 
 uint8_t Joystick::holdProgress2() const {
+  // 0..9 toward JOY_VERY_LONG_MS (2s) for Wi-Fi scan screen
   if (!_btnDown) return 0;
   uint32_t ms = heldMs();
-  if (ms >= JOY_VERY_LONG_MS) return 100;
-  return (uint8_t)((ms * 100UL) / JOY_VERY_LONG_MS);
+  if (ms >= JOY_VERY_LONG_MS) return 9;
+  uint8_t v = (uint8_t)((ms * 9UL) / JOY_VERY_LONG_MS);
+  return v < 1 ? 1 : (v > 9 ? 9 : v);
 }
 
 void Joystick::update() {

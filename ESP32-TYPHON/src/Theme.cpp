@@ -20,24 +20,26 @@ void clear(uint16_t color) {
 }
 
 void drawStatusBar(const char* title, int holdPct) {
-  // Brand header + optional screen title
+  (void)holdPct;  // counter drawn only via drawHoldCounter() — avoids full-screen redraw
   tft.fillRect(0, 0, SCREEN_W, 16, 0x10A2);
   tft.drawFastHLine(0, 16, SCREEN_W, COL_BORDER);
-
   tft.setTextColor(COL_TITLE, 0x10A2);
   tft.setTextDatum(TL_DATUM);
   tft.setCursor(2, 4);
   tft.print("ESP32-TYPHON");
+}
 
-  // Secondary title squeezed if room
-  if (title && title[0] && strcmp(title, "ESP32-TYPHON") != 0) {
-    // small tag under brand not possible in 16px — append short form after space if short
-  }
-
-  if (holdPct >= 0 && holdPct <= 100) {
-    char buf[8];
-    snprintf(buf, sizeof(buf), "%d", holdPct);
-    tft.setTextColor(holdPct >= 100 ? COL_WARN : COL_ACCENT, 0x10A2);
+// Partial update: top-right only (approx x=140..159, y=0..15)
+void drawHoldCounter(int level) {
+  const int x = SCREEN_W - 20;
+  const int y = 0;
+  const int w = 20;
+  const int h = 16;
+  tft.fillRect(x, y, w, h, 0x10A2);  // same as status bar bg
+  if (level >= 1 && level <= 9) {
+    char buf[4];
+    snprintf(buf, sizeof(buf), "%d", level);
+    tft.setTextColor(level >= 9 ? COL_WARN : COL_ACCENT, 0x10A2);
     tft.setTextDatum(TR_DATUM);
     tft.drawString(buf, SCREEN_W - 2, 4);
   }
