@@ -57,6 +57,13 @@ static void probeUpdate();
 static void beaconUpdate();
 static void karmaUpdate();
 static void floodUpdate();
+
+static void deauthStop();
+static void probeStop();
+static void beaconStop();
+static void floodStop();
+static void karmaStop();
+
 static void eapolUpdate();
 static void sourUpdate();
 static void jamUpdate();
@@ -4205,9 +4212,9 @@ void UI::handleInput(JoyAction a) {
   }
 
   if (a == JOY_UP || a == JOY_HOLD_UP) {
-    if (_sel > 0) { _sel--; menuEnsureVisible(_sel, _top, count, Theme::MENU_ROWS); _dirty = true; }
+    if (_sel > 0) { _sel--; menuEnsureVisible(_sel, _top, count, 5 /*MENU_ROWS*/); _dirty = true; }
   } else if (a == JOY_DOWN || a == JOY_HOLD_DOWN) {
-    if (_sel < count-1) { _sel++; menuEnsureVisible(_sel, _top, count, Theme::MENU_ROWS); _dirty = true; }
+    if (_sel < count-1) { _sel++; menuEnsureVisible(_sel, _top, count, 5 /*MENU_ROWS*/); _dirty = true; }
   } else if (a == JOY_SELECT) {
     if (_screen == SCR_MAIN) {
       if (_sel == 0) enterScreen(SCR_WIFI_MENU);
