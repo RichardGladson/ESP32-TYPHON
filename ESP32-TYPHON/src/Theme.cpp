@@ -1,4 +1,6 @@
 #include "Theme.h"
+#include <string.h>
+#include <stdio.h>
 
 TFT_eSPI tft = TFT_eSPI();
 
@@ -17,20 +19,27 @@ void clear(uint16_t color) {
   tft.fillScreen(color);
 }
 
-void drawStatusBar(const char* title, bool showBackHint) {
-  // Top bar 0..15
-  tft.fillRect(0, 0, SCREEN_W, 16, 0x10A2);          // dark navy
+void drawStatusBar(const char* title, int holdPct) {
+  // Brand header + optional screen title
+  tft.fillRect(0, 0, SCREEN_W, 16, 0x10A2);
   tft.drawFastHLine(0, 16, SCREEN_W, COL_BORDER);
 
   tft.setTextColor(COL_TITLE, 0x10A2);
   tft.setTextDatum(TL_DATUM);
-  tft.setCursor(4, 4);
-  tft.print(title);
+  tft.setCursor(2, 4);
+  tft.print("ESP32-TYPHON");
 
-  if (showBackHint) {
-    tft.setTextColor(COL_DIM, 0x10A2);
+  // Secondary title squeezed if room
+  if (title && title[0] && strcmp(title, "ESP32-TYPHON") != 0) {
+    // small tag under brand not possible in 16px — append short form after space if short
+  }
+
+  if (holdPct >= 0 && holdPct <= 100) {
+    char buf[8];
+    snprintf(buf, sizeof(buf), "%d", holdPct);
+    tft.setTextColor(holdPct >= 100 ? COL_WARN : COL_ACCENT, 0x10A2);
     tft.setTextDatum(TR_DATUM);
-    tft.drawString("L-BACK", SCREEN_W - 4, 4);
+    tft.drawString(buf, SCREEN_W - 2, 4);
   }
 }
 
@@ -52,7 +61,8 @@ void drawFooter(const char* left, const char* right) {
 
 void drawMenuList(const char* const* items, int count, int selected, int topVisible,
                   int yStart, int rowH) {
-  const int maxRows = (112 - yStart) / rowH;   // leave room for footer
+  int maxRows = (112 - yStart) / rowH;   // leave room for footer
+  if (maxRows < 1) maxRows = 1;
 
   // Clear list area
   tft.fillRect(0, yStart, SCREEN_W, 112 - yStart, COL_BG);
