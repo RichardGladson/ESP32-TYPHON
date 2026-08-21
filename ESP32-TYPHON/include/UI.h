@@ -25,7 +25,6 @@ enum Screen : uint8_t {
   SCR_SOUR_APPLE,
   SCR_BLE_JAM,
   SCR_AIRTAG,
-  SCR_ABOUT,
   SCR_COUNT
 };
 
