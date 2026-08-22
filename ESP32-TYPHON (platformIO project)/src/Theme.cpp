@@ -1,4 +1,6 @@
 #include "Theme.h"
+#include <string.h>
+#include <stdio.h>
 
 TFT_eSPI tft = TFT_eSPI();
 
@@ -17,20 +19,29 @@ void clear(uint16_t color) {
   tft.fillScreen(color);
 }
 
-void drawStatusBar(const char* title, bool showBackHint) {
-  // Top bar 0..15
-  tft.fillRect(0, 0, SCREEN_W, 16, 0x10A2);          // dark navy
+void drawStatusBar(const char* title, int holdPct) {
+  (void)holdPct;  // counter drawn only via drawHoldCounter() — avoids full-screen redraw
+  tft.fillRect(0, 0, SCREEN_W, 16, 0x10A2);
   tft.drawFastHLine(0, 16, SCREEN_W, COL_BORDER);
-
   tft.setTextColor(COL_TITLE, 0x10A2);
   tft.setTextDatum(TL_DATUM);
-  tft.setCursor(4, 4);
-  tft.print(title);
+  tft.setCursor(2, 4);
+  tft.print("ESP32-TYPHON");
+}
 
-  if (showBackHint) {
-    tft.setTextColor(COL_DIM, 0x10A2);
+// Partial update: top-right only (approx x=140..159, y=0..15)
+void drawHoldCounter(int level) {
+  const int x = SCREEN_W - 20;
+  const int y = 0;
+  const int w = 20;
+  const int h = 16;
+  tft.fillRect(x, y, w, h, 0x10A2);  // same as status bar bg
+  if (level >= 1 && level <= 9) {
+    char buf[4];
+    snprintf(buf, sizeof(buf), "%d", level);
+    tft.setTextColor(level >= 9 ? COL_WARN : COL_ACCENT, 0x10A2);
     tft.setTextDatum(TR_DATUM);
-    tft.drawString("L-BACK", SCREEN_W - 4, 4);
+    tft.drawString(buf, SCREEN_W - 2, 4);
   }
 }
 
@@ -52,7 +63,8 @@ void drawFooter(const char* left, const char* right) {
 
 void drawMenuList(const char* const* items, int count, int selected, int topVisible,
                   int yStart, int rowH) {
-  const int maxRows = (112 - yStart) / rowH;   // leave room for footer
+  int maxRows = (112 - yStart) / rowH;   // leave room for footer
+  if (maxRows < 1) maxRows = 1;
 
   // Clear list area
   tft.fillRect(0, yStart, SCREEN_W, 112 - yStart, COL_BG);

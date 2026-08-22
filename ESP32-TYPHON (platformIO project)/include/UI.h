@@ -3,7 +3,6 @@
 #include "BoardConfig.h"
 #include "Joystick.h"
 
-// All screens
 enum Screen : uint8_t {
   SCR_MAIN = 0,
   SCR_WIFI_MENU,
@@ -12,8 +11,13 @@ enum Screen : uint8_t {
   SCR_PACKET_MON,
   SCR_BEACON,
   SCR_DEAUTH,
+  SCR_CLIENT_SNIFF,
   SCR_DEAUTH_DET,
   SCR_PROBE,
+  SCR_KARMA,
+  SCR_FLOOD,
+  SCR_EAPOL,
+  SCR_WAR,
   SCR_CAPTIVE,
   SCR_BLE_SCAN,
   SCR_BLE_SNIFF,
@@ -21,7 +25,6 @@ enum Screen : uint8_t {
   SCR_SOUR_APPLE,
   SCR_BLE_JAM,
   SCR_AIRTAG,
-  SCR_ABOUT,
   SCR_COUNT
 };
 
