@@ -67,6 +67,8 @@ static void karmaStop();
 
 static void eapolUpdate();
 static void sourUpdate();
+static void sourDevUpdate();
+static void sourDevStop();
 static void jamUpdate();
 static void spoofUpdate();
 static void airSpoofUpdate();
@@ -148,6 +150,7 @@ static bool karmaRunning = false;
 static bool floodRunning = false;
 static bool eapolRunning = false;
 static bool sourRunning = false;
+static bool sourDevRunning = false;
 static bool jamRunning = false;
 static bool spoofRunning = false;
 static bool airSpoofRunning = false;
@@ -652,8 +655,9 @@ static void bleCoreLoop(void* arg) {
       vTaskDelay(1);
       continue;
     }
-    if (sourRunning || jamRunning || spoofRunning || airSpoofRunning) {
+    if (sourRunning || sourDevRunning || jamRunning || spoofRunning || airSpoofRunning) {
       if (sourRunning) sourUpdate();
+      if (sourDevRunning) sourDevUpdate();
       if (jamRunning) jamUpdate();
       if (spoofRunning) spoofUpdate();
       if (airSpoofRunning) airSpoofUpdate();
@@ -1801,6 +1805,7 @@ static void stopAllTools() {
   captiveStop();
   sniffStop();
   spoofStop();
+  sourDevStop();
   sourStop();
   jamStop();
   airTagStop();
@@ -2665,8 +2670,36 @@ static const AppleType appleList[] = {
 static const int APPLE_LIST_COUNT = sizeof(appleList) / sizeof(appleList[0]);
 
 static int      sourSelected = 0;    // index into appleList / SOUR_ACTION_TYPES
-static uint32_t sourLast = 0;
-static uint32_t sourSent = 0;
+
+// Sour Apple category submenu
+static const char* const SOUR_CAT_ITEMS[] = {
+  "Continuity alerts",
+  "Device-style ads",
+  "Back"
+};
+static const int SOUR_CAT_COUNT = 3;
+
+// Device-style name advertisements (not Continuity popups)
+struct SourDeviceTpl {
+  const char* name;
+  // Simple flags + complete local name ADV (device appearance on scanners)
+};
+static const char* const SOUR_DEV_NAMES[] = {
+  "AirPods Pro",
+  "AirPods Max",
+  "Apple Watch",
+  "iPhone",
+  "iPad",
+  "MacBook Pro",
+  "Apple TV",
+  "HomePod",
+  "Clone BLE scan…",  // jumps to BLE Spoofer
+  "Back"
+};
+static const int SOUR_DEV_COUNT = 10;
+static int sourDevSelected = 0;
+static uint32_t sourDevLast = 0;
+static uint32_t sourDevSent = 0;
 
 static esp_ble_adv_params_t sourAdvParams = {
   .adv_int_min = 0x20,
@@ -2676,6 +2709,55 @@ static esp_ble_adv_params_t sourAdvParams = {
   .channel_map = ADV_CHNL_ALL,
   .adv_filter_policy = ADV_FILTER_ALLOW_SCAN_ANY_CON_ANY,
 };
+
+static void sourDevStop() {
+  if (!sourDevRunning) return;
+  sourDevRunning = false;
+  esp_ble_gap_stop_advertising();
+  radioRelease(RADIO_BLE_ADV);
+}
+
+static void sourDevBuildNameAdv(uint8_t* packet, uint8_t* plen, const char* nm) {
+  // Flags (LE General Discoverable) + Complete Local Name
+  size_t nl = nm ? strnlen(nm, 26) : 0;
+  packet[0] = 0x02; packet[1] = 0x01; packet[2] = 0x06;
+  packet[3] = (uint8_t)(nl + 1);
+  packet[4] = 0x09;  // Complete Local Name
+  if (nl) memcpy(packet + 5, nm, nl);
+  *plen = (uint8_t)(5 + nl);
+}
+
+static void sourDevBegin() {
+  if (sourDevSelected < 0 || sourDevSelected >= 8) return;  // 0..7 are templates
+  sourStop();
+  sniffStop(); spoofStop(); jamStop(); airSpoofStop();
+  bleEnsureNotScanning();
+  radioAcquire(RADIO_BLE_ADV);
+  bleInit();
+  if (!bleReady) { radioRelease(RADIO_BLE_ADV); return; }
+  esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_DEFAULT, ESP_PWR_LVL_P9);
+  esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_ADV, ESP_PWR_LVL_P9);
+  sourDevRunning = true;
+  sourDevLast = 0;
+  sourDevSent = 0;
+}
+
+static void sourDevUpdate() {
+  if (!sourDevRunning) return;
+  if (millis() - sourDevLast < 100) return;
+  sourDevLast = millis();
+  sourDevSent++;
+  if (!bleReady) return;
+  uint8_t packet[31];
+  uint8_t plen = 0;
+  const char* nm = SOUR_DEV_NAMES[sourDevSelected];
+  sourDevBuildNameAdv(packet, &plen, nm);
+  bleAdvStartRaw(packet, plen, &sourAdvParams);
+}
+
+
+static uint32_t sourLast = 0;
+static uint32_t sourSent = 0;
 
 // Exact 17-byte Continuity packet from RapierXbox ESP32-Sour-Apple
 static void sourBuildPacket(uint8_t* packet, uint8_t* plen, int typeIdx) {
@@ -4287,10 +4369,19 @@ void UI::enterScreen(Screen s) {
   if (s == SCR_BLE_SNIFF)  sniffStart();
   if (s == SCR_BLE_SPOOF)  { spoofStop(); }
   if (s == SCR_SOUR_APPLE) {
-    sourStart();
+    sourStop();
+    sourDevStop();
+    _sel = 0; _top = 0;
+  }
+  if (s == SCR_SOUR_NOTIF) {
+    sourDevStop();
     if (sourSelected < 0) sourSelected = 0;
     _sel = sourSelected;
-    if (_sel >= 6) _top = _sel - 5;
+    if (_sel >= 5) _top = _sel - 4;
+  }
+  if (s == SCR_SOUR_DEVICES) {
+    sourStop();
+    _sel = 0; _top = 0;
   }
   if (s == SCR_BLE_JAM)    { jamStop(); }
   if (s == SCR_AIRTAG)     { airTagStart(); airMenuSel = 0; }
@@ -4299,7 +4390,7 @@ void UI::enterScreen(Screen s) {
 void UI::goBack() {
   wifiScanDetail = false;
   pmStop(); beaconStop(); detStop(); deauthStop(); clientSniffStop(); probeStop(); captiveStop();
-  sniffStop(); spoofStop(); sourStop(); jamStop(); airTagStop();
+  sniffStop(); spoofStop(); sourStop(); sourDevStop(); jamStop(); airTagStop();
 
   switch (_screen) {
     case SCR_WIFI_MENU: case SCR_BLE_MENU:
@@ -4311,6 +4402,8 @@ void UI::goBack() {
     case SCR_BLE_SCAN: case SCR_BLE_SNIFF: case SCR_BLE_SPOOF:
     case SCR_SOUR_APPLE: case SCR_BLE_JAM: case SCR_AIRTAG:
       enterScreen(SCR_BLE_MENU); break;
+    case SCR_SOUR_NOTIF: case SCR_SOUR_DEVICES:
+      enterScreen(SCR_SOUR_APPLE); break;
     default:
       enterScreen(SCR_MAIN); break;
   }
@@ -4572,8 +4665,22 @@ void UI::handleInput(JoyAction a) {
     return;
   }
 
-  // Sour Apple – pick Continuity action type, then spam
+  // Sour Apple – category menu
   if (_screen == SCR_SOUR_APPLE) {
+    if (a == JOY_UP || a == JOY_HOLD_UP) {
+      if (_sel > 0) { _sel--; _dirty = true; }
+    } else if (a == JOY_DOWN || a == JOY_HOLD_DOWN) {
+      if (_sel < SOUR_CAT_COUNT - 1) { _sel++; _dirty = true; }
+    } else if (a == JOY_SELECT) {
+      if (_sel == 0) enterScreen(SCR_SOUR_NOTIF);
+      else if (_sel == 1) enterScreen(SCR_SOUR_DEVICES);
+      else goBack();
+    } else if (a == JOY_BACK) goBack();
+    return;
+  }
+
+  // Continuity notifications (action types)
+  if (_screen == SCR_SOUR_NOTIF) {
     const int sourMenuCount = APPLE_LIST_COUNT;
     if (sourRunning) {
       if (a == JOY_BACK || a == JOY_SELECT) { sourStop(); _dirty = true; }
@@ -4582,11 +4689,35 @@ void UI::handleInput(JoyAction a) {
     if (a == JOY_UP || a == JOY_HOLD_UP) {
       if (_sel > 0) { _sel--; menuEnsureVisible(_sel, _top, sourMenuCount, 5); _dirty = true; }
     } else if (a == JOY_DOWN || a == JOY_HOLD_DOWN) {
-      if (_sel < sourMenuCount-1) { _sel++; menuEnsureVisible(_sel, _top, sourMenuCount, 5); _dirty = true; }
+      if (_sel < sourMenuCount - 1) { _sel++; menuEnsureVisible(_sel, _top, sourMenuCount, 5); _dirty = true; }
     } else if (a == JOY_SELECT) {
       sourSelected = _sel;
       sourBeginAdvertise();
       _dirty = true;
+    } else if (a == JOY_BACK) goBack();
+    return;
+  }
+
+  // Device-style ads
+  if (_screen == SCR_SOUR_DEVICES) {
+    if (sourDevRunning) {
+      if (a == JOY_BACK || a == JOY_SELECT) { sourDevStop(); _dirty = true; }
+      return;
+    }
+    if (a == JOY_UP || a == JOY_HOLD_UP) {
+      if (_sel > 0) { _sel--; menuEnsureVisible(_sel, _top, SOUR_DEV_COUNT, 5); _dirty = true; }
+    } else if (a == JOY_DOWN || a == JOY_HOLD_DOWN) {
+      if (_sel < SOUR_DEV_COUNT - 1) { _sel++; menuEnsureVisible(_sel, _top, SOUR_DEV_COUNT, 5); _dirty = true; }
+    } else if (a == JOY_SELECT) {
+      if (_sel == SOUR_DEV_COUNT - 1) goBack();  // Back
+      else if (_sel == SOUR_DEV_COUNT - 2) {
+        // Clone BLE scan → existing spoofer
+        enterScreen(SCR_BLE_SPOOF);
+      } else {
+        sourDevSelected = _sel;
+        sourDevBegin();
+        _dirty = true;
+      }
     } else if (a == JOY_BACK) goBack();
     return;
   }
@@ -5074,7 +5205,14 @@ static void drawWarScreen() {
 
 
 static void drawSourAppleList(int sel, int top) {
+  // Category root
   Theme::drawStatusBar("Sour Apple");
+  Theme::drawMenuList(SOUR_CAT_ITEMS, SOUR_CAT_COUNT, sel, 0);
+  drawActivityFooter();
+}
+
+static void drawSourNotifScreen(int sel, int top) {
+  Theme::drawStatusBar("Continuity");
   if (sourRunning) {
     Theme::printCentered("SPAMMING", 36, COL_OK, 1);
     const char* nm = (sourSelected >= 0 && sourSelected < APPLE_LIST_COUNT)
@@ -5086,10 +5224,25 @@ static void drawSourAppleList(int sel, int top) {
     drawActivityFooter();
     return;
   }
-  static const char* names[40];
+  static const char* names[16];
   int n = 0;
-  for (int i = 0; i < APPLE_LIST_COUNT && n < 40; i++) names[n++] = appleList[i].name;
-  Theme::drawMenuList(names, n, sel, top, 18, 14);
+  for (int i = 0; i < APPLE_LIST_COUNT && n < 16; i++) names[n++] = appleList[i].name;
+  Theme::drawMenuList(names, n, sel, top);
+  drawActivityFooter();
+}
+
+static void drawSourDevicesScreen(int sel, int top) {
+  Theme::drawStatusBar("Device ads");
+  if (sourDevRunning) {
+    Theme::printCentered("ADVERTISING", 36, COL_OK, 1);
+    Theme::printCentered(SOUR_DEV_NAMES[sourDevSelected], 52, COL_FG, 1);
+    char buf[28];
+    snprintf(buf, sizeof(buf), "%lu pkts", (unsigned long)sourDevSent);
+    Theme::printCentered(buf, 68, COL_DIM, 1);
+    drawActivityFooter();
+    return;
+  }
+  Theme::drawMenuList(SOUR_DEV_NAMES, SOUR_DEV_COUNT, sel, top);
   drawActivityFooter();
 }
 
@@ -5186,6 +5339,8 @@ void UI::drawCurrent() {
     case SCR_EAPOL:      drawEapolScreen(); break;
     case SCR_WAR:        drawWarScreen(); break;
     case SCR_SOUR_APPLE:  drawSourAppleList(_sel, _top); break;
+    case SCR_SOUR_NOTIF:  drawSourNotifScreen(_sel, _top); break;
+    case SCR_SOUR_DEVICES: drawSourDevicesScreen(_sel, _top); break;
     case SCR_BLE_JAM:     drawJamScreen(); break;
     case SCR_AIRTAG:      drawAirTagScreen(); break;
 
@@ -5291,7 +5446,10 @@ void UI::loop() {
     if (_screen == SCR_FLOOD && floodRunning && floodSent != lastFlood) { lastFlood = floodSent; need = true; }
     if (_screen == SCR_EAPOL && eapolRunning && eapolCount != (int)lastEapol) { lastEapol = eapolCount; need = true; }
     if (_screen == SCR_CAPTIVE) need = true;
-    if (_screen == SCR_SOUR_APPLE && sourRunning && sourSent != lastSour) { lastSour = sourSent; need = true; }
+    if ((_screen == SCR_SOUR_NOTIF && sourRunning && sourSent != lastSour) ||
+        (_screen == SCR_SOUR_DEVICES && sourDevRunning && sourDevSent != lastSour)) {
+      lastSour = sourRunning ? sourSent : sourDevSent; need = true;
+    }
     if (_screen == SCR_BLE_JAM && jamRunning && jamCount != lastJam) { lastJam = jamCount; need = true; }
     if (_screen == SCR_AIRTAG && (airDetRunning || airSpoofRunning)) need = true;
     // BLE scan / sniff: live pkt + device counters on TFT
