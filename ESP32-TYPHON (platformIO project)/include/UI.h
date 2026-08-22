@@ -22,7 +22,9 @@ enum Screen : uint8_t {
   SCR_BLE_SCAN,
   SCR_BLE_SNIFF,
   SCR_BLE_SPOOF,
-  SCR_SOUR_APPLE,
+  SCR_SOUR_APPLE,     // category: notifications vs device ads
+  SCR_SOUR_NOTIF,     // Continuity action list
+  SCR_SOUR_DEVICES,   // device-style ADV templates
   SCR_BLE_JAM,
   SCR_AIRTAG,
   SCR_COUNT
