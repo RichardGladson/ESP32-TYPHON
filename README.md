@@ -1,4 +1,10 @@
-# ESP32-TYPHON
+## ESP32-TYPHON
+---
+## 🛑Project is not fully functional
+**ESP32-TYPHON is not a fully functional project. While there are multiple features in the menu, most of them do not work yet. The only features that work are the AirTag finder, BLE scanner and Wi-Fi scanner+analyzer. I'm still learning Wi-Fi and BLE protocols, so this will take some time for me to get working. Stay tuned for future updates!**
+
+<hr>
+<br>
 
 Handheld **Wi‑Fi and Bluetooth research toolkit** for the classic **ESP32-WROOM**, with a 1.8″ ST7735 TFT and analog joystick. Designed for lab use on networks and devices you own or have explicit permission to test.
 
